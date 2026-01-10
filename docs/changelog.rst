@@ -8,6 +8,10 @@ HEAD
 
 Code changes to ``master`` that are *not* in the latest release:
 
+Release v2.1.1
+-----------------
+- Fix Python import issue
+
 Release v2.1.0
 -----------------
 - Support Windows: Use tcp socket for daemon communication on Windows systems.
