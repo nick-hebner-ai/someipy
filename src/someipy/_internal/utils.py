@@ -42,7 +42,8 @@ def create_udp_socket(ip_address: str, port: int) -> socket.socket:
 
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if platform.system() == "Linux":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.bind((ip_address, port))
     return sock
@@ -72,11 +73,12 @@ def create_rcv_multicast_socket(
 
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
     os_type = platform.system()
     if os_type == "Windows":
         sock.bind(("", port))
     else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((ip_address, port))
 
     # Specify the interface for multicast group membership instead of INADDR_ANY

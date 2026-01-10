@@ -8,6 +8,10 @@ HEAD
 
 Code changes to ``master`` that are *not* in the latest release:
 
+Release v2.1.2
+-----------------
+- Fix SO_REUSEADDR socket option on Windows
+
 Release v2.1.1
 -----------------
 - Fix Python import issue

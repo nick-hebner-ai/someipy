@@ -16,6 +16,7 @@
 import asyncio
 import logging
 import os
+import platform
 from someipy._internal._common.event import Event
 from someipy._internal._daemon.daemon_server_client import DaemonServerClient
 
@@ -62,11 +63,13 @@ class DaemonServer:
             )
             self._logger.info(f"Unix domain socket server started at {socket_path}")
         else:
+            reuse_port = platform.system() == "Linux"
+
             self._server = await asyncio.start_server(
                 self._handle_client,
                 host=host,
                 port=tcp_port,
-                reuse_port=True,
+                reuse_port=reuse_port,
             )
             self._logger.info(f"TCP server started at {host}:{tcp_port}")
 
