@@ -45,6 +45,9 @@ jobs:
       run: coverage json -o coverage.json
 
     - name: Upload coverage json to gist
+      # Only runs when the GIST_ID/GIST_TOKEN secrets are configured. Forks
+      # without these secrets skip this step instead of failing the job.
+      if: env.GIST_TOKEN != '' && env.GIST_ID != ''
       env:
         GIST_ID: ${{ secrets.GIST_ID }}
         GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
