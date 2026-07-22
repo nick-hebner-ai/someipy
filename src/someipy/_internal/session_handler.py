@@ -26,7 +26,19 @@ class SessionHandler:
     def update_session(self) -> Tuple[int, bool]:
         self.session_id += 1
         if self.session_id > 0xFFFF:
+            # The session id must never be 0, so it wraps to 1 rather than 0.
             self.session_id = 1
-            self.reboot_flag = False
 
-        return self.session_id, self.reboot_flag
+        # Per AUTOSAR PRS_SOMEIPSD_00423 the reboot flag is set only on the
+        # first SD message after (re)boot and cleared on every message after
+        # that. Clear it after the first update_session() call instead of
+        # waiting for the session id to wrap at 0xFFFF: otherwise the flag
+        # stays set for up to 65535 messages, and two independently paced
+        # handlers (e.g. a fast unicast handler and a slow multicast handler)
+        # clear it at very different times. A strict SD peer then sees a
+        # cleared-flag message followed by a still-set-flag message from the
+        # same source and reports a spurious reboot.
+        current_reboot_flag = self.reboot_flag
+        self.reboot_flag = False
+
+        return self.session_id, current_reboot_flag
