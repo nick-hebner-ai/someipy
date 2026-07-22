@@ -913,9 +913,26 @@ class SomeipDaemon:
         payload_decoded = base64.b64decode(message["payload"])
         header.length = 8 + len(payload_decoded)
 
-        endpoint = self._someip_server_endpoints.get_endpoint(
-            writer_id, TransportLayerProtocol(message["protocol"])
-        )
+        # Send the response from the endpoint the request arrived on. For a
+        # client offering multiple services on different ports, the generic
+        # get_endpoint(writer_id, ...) returns the first endpoint of that
+        # protocol -- possibly the wrong source port, which the peer rejects
+        # ("Instance ID not found"). Look up the offered service's own endpoint
+        # (matched by service and instance id) instead, falling back to the
+        # generic lookup if the service is not found.
+        protocol = TransportLayerProtocol(message["protocol"])
+        endpoint = None
+        for service in self._services_to_offer.get_all_services():
+            if (
+                service.service_id == message["service_id"]
+                and service.instance_id == message["instance_id"]
+            ):
+                endpoint = self._someip_server_endpoints.get_endpoint_by_ip_port(
+                    str(service.endpoint.ip), service.endpoint.port, protocol
+                )
+                break
+        if endpoint is None:
+            endpoint = self._someip_server_endpoints.get_endpoint(writer_id, protocol)
         self.logger.debug(
             f"Sending CallMethodResponse to {message['src_endpoint_ip']}:{message['src_endpoint_port']}"
         )
