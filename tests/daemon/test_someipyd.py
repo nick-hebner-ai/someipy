@@ -6,7 +6,7 @@ import logging
 import time
 import pytest
 import pytest_asyncio
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import someipy
 from someipy._internal._common.endpoint import Endpoint
 from someipy._internal._daemon.daemon_server import ClientConnectedEventArgs
@@ -642,3 +642,35 @@ def test_send_event_does_not_log_error_when_endpoint_present(daemon):
         "server endpoint" in str(call.args[0])
         for call in daemon.logger.error.call_args_list
     )
+
+
+@pytest.mark.parametrize(
+    "sd_address, expect_multicast",
+    [
+        ("224.224.224.245", True),
+        ("239.192.0.251", True),  # class-D multicast; regressed before the fix
+        ("225.0.0.1", True),  # class-D multicast; regressed before the fix
+        ("255.255.255.255", False),  # limited broadcast, not multicast
+    ],
+)
+@pytest.mark.asyncio
+async def test_start_sd_listening_selects_socket_by_multicast_range(
+    daemon: SomeipDaemon, sd_address, expect_multicast
+):
+    # Any IPv4 multicast address (224.0.0.0/4) must use the multicast receive
+    # socket (which joins the group). A "224" prefix check missed 225-239.
+    daemon.sd_address = sd_address
+    loop = asyncio.get_running_loop()
+    with patch("someipy.someipyd.create_rcv_multicast_socket") as mcast, patch(
+        "someipy.someipyd.create_rcv_broadcast_socket"
+    ) as bcast, patch("someipy.someipyd.create_udp_socket"), patch.object(
+        loop, "create_datagram_endpoint", new=AsyncMock(return_value=(Mock(), Mock()))
+    ):
+        await daemon.start_sd_listening()
+
+    if expect_multicast:
+        mcast.assert_called_once()
+        bcast.assert_not_called()
+    else:
+        bcast.assert_called_once()
+        mcast.assert_not_called()
