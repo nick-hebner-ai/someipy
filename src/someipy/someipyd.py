@@ -89,6 +89,7 @@ from someipy._internal.subscribers import EventGroupSubscriber, Subscribers
 from someipy._internal._daemon.uds_messages import (
     InboundCallMethodRequest,
     InboundCallMethodResponse,
+    InboundSubscription,
     FindServiceRequest,
     FindServiceResponse,
     OfferServiceRequest,
@@ -1559,9 +1560,28 @@ class SomeipDaemon:
                 if offered_service not in self._service_subscribers:
                     self._service_subscribers[offered_service] = Subscribers()
 
-                self._service_subscribers[offered_service].add_subscriber(
-                    new_subscriber
-                )
+                subscribers = self._service_subscribers[offered_service]
+                # A subscriber compares equal by eventgroup id + endpoint, so
+                # whether an equal one is already present distinguishes a renewal
+                # from a brand-new subscription.
+                is_renewal = new_subscriber in subscribers.subscribers
+                subscribers.add_subscriber(new_subscriber)
+
+                # Notify the offering client that a remote subscriber
+                # (un)subscribed, so it can track subscription state.
+                tx_queue = self._tx_queues.get(offered_service.client_writer_id)
+                if tx_queue is not None:
+                    subscription_msg = create_uds_message(
+                        InboundSubscription,
+                        service_id=offered_service.service_id,
+                        instance_id=offered_service.instance_id,
+                        event_group_id=sd_subscription.eventgroup_id,
+                        subscriber_ip=str(sd_subscription.ipv4_address),
+                        subscriber_port=sd_subscription.port,
+                        ttl_seconds=int(sd_subscription.ttl),
+                        is_renewal=is_renewal,
+                    )
+                    tx_queue.put_nowait(self.prepare_message(subscription_msg))
 
                 if self._ucast_transport:
                     self._ucast_transport.sendto(

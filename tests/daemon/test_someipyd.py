@@ -2,7 +2,9 @@ from asyncio import DatagramTransport
 import asyncio
 import base64
 import ipaddress
+import json
 import logging
+import struct
 import time
 import pytest
 import pytest_asyncio
@@ -31,6 +33,7 @@ from someipy._internal.someip_endpoint_factory import SomeipEndpointFactory
 from someipy._internal.message_types import MessageType
 from someipy._internal.someip_header import SomeIpHeader
 from someipy._internal.someip_message import SomeIpMessage
+from someipy._internal.someip_sd_header import SdSubscription
 from someipy._internal.transport_layer_protocol import TransportLayerProtocol
 from someipy.service import Event, EventGroup, Method
 from someipy.someipyd import DaemonServer, SomeipDaemon
@@ -795,3 +798,88 @@ def test_method_response_uses_offered_service_endpoint_not_first(daemon: SomeipD
     # The response must go out service B's endpoint (port 3001), not port 3000.
     endpoint_b.sendto.assert_called_once()
     endpoint_a.sendto.assert_not_called()
+
+
+def _decode_client_message(framed: bytes) -> dict:
+    # prepare_message frames a message as: 4-byte little-endian payload length,
+    # then padding out to a 256-byte header, then the JSON payload.
+    length = struct.unpack("<I", framed[:4])[0]
+    return json.loads(framed[256 : 256 + length].decode("utf-8"))
+
+
+def _offer_service_for_subscription(daemon, writer_id):
+    service = ServiceToOffer(
+        client_writer_id=writer_id,
+        instance_id=0x5678,
+        service_id=0x1234,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.1"), 3000),
+        methods=[],
+        eventgroups=[EventGroup(id=0x0003, events=[Event(id=1, protocol=TransportLayerProtocol.UDP)])],
+    )
+    daemon._services_to_offer.add_service(service)
+
+
+def _subscription():
+    return SdSubscription(
+        service_id=0x1234,
+        instance_id=0x5678,
+        major_version=1,
+        ttl=10,
+        initial_data_requested_flag=0,
+        counter=0,
+        eventgroup_id=0x0003,
+        ipv4_address=ipaddress.IPv4Address("192.168.1.50"),
+        port=30509,
+        protocol=TransportLayerProtocol.UDP,
+    )
+
+
+def test_subscription_notifies_offering_client(daemon: SomeipDaemon):
+    # When a remote subscriber subscribes to an offered service, the offering
+    # client is notified with an InboundSubscription message.
+    writer_id = 1
+    _offer_service_for_subscription(daemon, writer_id)
+    daemon._tx_queues[writer_id] = asyncio.Queue()
+
+    daemon._handle_subscription(_subscription())
+
+    assert daemon._tx_queues[writer_id].qsize() == 1
+    msg = _decode_client_message(daemon._tx_queues[writer_id].get_nowait())
+    assert msg["type"] == "InboundSubscription"
+    assert msg["service_id"] == 0x1234
+    assert msg["instance_id"] == 0x5678
+    assert msg["event_group_id"] == 0x0003
+    assert msg["subscriber_ip"] == "192.168.1.50"
+    assert msg["subscriber_port"] == 30509
+    assert msg["ttl_seconds"] == 10
+    assert msg["is_renewal"] is False
+
+
+def test_subscription_renewal_is_flagged(daemon: SomeipDaemon):
+    # The same subscriber subscribing again is reported as a renewal.
+    writer_id = 1
+    _offer_service_for_subscription(daemon, writer_id)
+    daemon._tx_queues[writer_id] = asyncio.Queue()
+
+    daemon._handle_subscription(_subscription())
+    daemon._handle_subscription(_subscription())
+
+    messages = [
+        _decode_client_message(daemon._tx_queues[writer_id].get_nowait())
+        for _ in range(daemon._tx_queues[writer_id].qsize())
+    ]
+    assert [m["is_renewal"] for m in messages] == [False, True]
+
+
+def test_subscription_without_matching_offer_sends_no_notification(daemon: SomeipDaemon):
+    # A subscription for a service this daemon does not offer notifies nobody.
+    writer_id = 1
+    daemon._tx_queues[writer_id] = asyncio.Queue()
+
+    daemon._handle_subscription(_subscription())  # no service offered
+
+    assert daemon._tx_queues[writer_id].qsize() == 0
