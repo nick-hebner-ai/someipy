@@ -84,14 +84,20 @@ def someipyd_config(sd_address=SD_MULTICAST) -> str:
     )
 
 
-def vsomeip_config(offers=None, sd_address=SD_MULTICAST) -> str:
+def vsomeip_config(offers=None, sd_address=SD_MULTICAST, sd_overrides=None) -> str:
     # `offers`, when given, is a list of {"service","instance","unreliable"}
     # dicts. vsomeip only multicasts OfferService for a service if the config
     # declares its port here; without it vsomeip treats the offer as internal
     # and never puts it on the wire. Client-role peers pass no offers.
+    # `sd_overrides` merges into the service-discovery block (e.g. a large
+    # cyclic_offer_delay so the peer stops re-offering, forcing the cache to
+    # expire and requiring an active FindService to re-resolve it).
     cfg = {
         "unicast": IP_VSOMEIP,
-        "logging": {"level": "verbose", "console": "true",
+        # vsomeip log levels are trace/debug/info/warning/error/fatal; "trace"
+        # is the most verbose. An unrecognized value silently falls back to
+        # "info", hiding SD join/find handling, so keep this a valid level.
+        "logging": {"level": "trace", "console": "true",
                     "file": {"enable": "false"}, "dlt": "false"},
         "applications": [{"name": "Hello", "id": "0x1313"}],
         "routing": "Hello",
@@ -106,6 +112,8 @@ def vsomeip_config(offers=None, sd_address=SD_MULTICAST) -> str:
             "request_response_delay": "1500",
         },
     }
+    if sd_overrides:
+        cfg["service-discovery"].update(sd_overrides)
     if offers:
         cfg["services"] = [
             {"service": o["service"], "instance": o["instance"],
@@ -123,7 +131,8 @@ class Case:
     """
 
     def __init__(self, name, someipy_app, vsomeip_app, evaluate,
-                 vsomeip_offers=None, sd_address=SD_MULTICAST):
+                 vsomeip_offers=None, sd_address=SD_MULTICAST,
+                 vsomeip_sd_overrides=None, duration=16):
         self.name = name
         self.someipy_app = someipy_app  # file under example_apps/
         self.vsomeip_app = vsomeip_app  # installed dir/binary name
@@ -132,6 +141,8 @@ class Case:
         # tests). Each is {"service","instance","unreliable"}. None = client.
         self.vsomeip_offers = vsomeip_offers
         self.sd_address = sd_address  # SD multicast group for this case
+        self.vsomeip_sd_overrides = vsomeip_sd_overrides  # merge into SD config
+        self.duration = duration  # per-case default run duration (seconds)
 
 
 def run_case(case: "Case", duration: int, keep: bool) -> bool:
@@ -148,7 +159,8 @@ def run_case(case: "Case", duration: int, keep: bool) -> bool:
         with open(os.path.join(cfg_dir, "someipyd.json"), "w") as f:
             f.write(someipyd_config(case.sd_address))
         with open(os.path.join(cfg_dir, "vsomeip-client.json"), "w") as f:
-            f.write(vsomeip_config(case.vsomeip_offers, case.sd_address))
+            f.write(vsomeip_config(case.vsomeip_offers, case.sd_address,
+                                   case.vsomeip_sd_overrides))
 
         someipy_cmd = (
             "PYTHONPATH=/work/src python3 /work/src/someipy/someipyd.py "
@@ -238,6 +250,16 @@ def _eval_discovery(someipy_lines, vsomeip_lines):
     return called > 0
 
 
+def _eval_rediscovery(someipy_lines, vsomeip_lines):
+    # The service is discovered initially, then its cached offer expires. The
+    # later call succeeds only if the daemon actively re-resolves it via
+    # FindService; otherwise it stays unresolved.
+    initial = any("INITIAL_DISCOVERY_OK" in l for l in someipy_lines)
+    rediscovered = any("REDISCOVERED Sum:" in l for l in someipy_lines)
+    print(f"  initial_discovery={initial} rediscovered_after_expiry={rediscovered}")
+    return initial and rediscovered
+
+
 TESTS = [
     Case("offer_method_udp", "offer_method_udp.py", "offer_method_udp", _eval_offer_method),
     Case("fire_and_forget_udp", "offer_method_udp.py", "fire_and_forget_udp", _eval_fire_and_forget),
@@ -251,13 +273,28 @@ TESTS = [
          vsomeip_offers=[{"service": "0x1234", "instance": "0x5678",
                           "unreliable": "30509"}],
          sd_address="239.192.0.251"),
+    # someipy (client) discovers a service, its cached offer expires (the vsomeip
+    # peer stops re-offering: large cyclic_offer_delay), then a later call must
+    # still succeed -- which requires the daemon to actively send a FindService
+    # to re-resolve. Without that the service stays unresolved after expiry.
+    Case("rediscover_after_expiry_udp", "rediscover_after_expiry_udp.py",
+         "call_method_udp", _eval_rediscovery,
+         vsomeip_offers=[{"service": "0x1234", "instance": "0x5678",
+                          "unreliable": "30509"}],
+         vsomeip_sd_overrides={"cyclic_offer_delay": "30000"},
+         # Budget: ~2s app start + up to 12s initial discovery + 8s for the
+         # cached offer to expire + several seconds to re-resolve (each find is
+         # answered after vsomeip's request_response_delay). 26s races the
+         # teardown against the answer; 34s leaves comfortable margin.
+         duration=34),
 ]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("tests", nargs="*", help="test names to run (default: all)")
-    ap.add_argument("--duration", type=int, default=16)
+    ap.add_argument("--duration", type=int, default=None,
+                    help="override run duration (default: per-case)")
     ap.add_argument("--keep", action="store_true", help="keep containers after run")
     args = ap.parse_args()
 
@@ -269,7 +306,8 @@ def main():
     results = {}
     for case in selected:
         print(f"=== running {case.name} ===")
-        results[case.name] = run_case(case, args.duration, args.keep)
+        duration = args.duration if args.duration is not None else case.duration
+        results[case.name] = run_case(case, duration, args.keep)
         print(f"{case.name}: {'PASS' if results[case.name] else 'FAIL'}\n")
 
     print("Summary:")
