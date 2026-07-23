@@ -298,7 +298,10 @@ class SomeipDaemon:
         )
 
         header = message.header
-        if MessageType(header.message_type) == MessageType.REQUEST:
+        if MessageType(header.message_type) in (
+            MessageType.REQUEST,
+            MessageType.REQUEST_NO_RETURN,
+        ):
             service_id = header.service_id
             method_id = header.method_id
 
