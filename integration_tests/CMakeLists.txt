@@ -3,7 +3,8 @@ cmake_minimum_required (VERSION 3.13)
 project(someipy_test_apps)
 
 set(CMAKE_BUILD_TYPE Debug)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
+# vsomeip's public headers use C++17 features (e.g. inline constexpr).
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
 
 
 find_package(vsomeip3 CONFIG REQUIRED)
@@ -33,3 +34,4 @@ create_test_target("offer_method_tcp")
 create_test_target("call_method_udp")
 create_test_target("call_method_tcp")
 create_test_target("offer_multiple_services")
+create_test_target("fire_and_forget_udp")

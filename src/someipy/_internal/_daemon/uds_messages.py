@@ -170,6 +170,20 @@ class ReceivedEvent(BaseMessage):
     payload: str
 
 
+class InboundSubscription(BaseMessage):
+    """Sent from the daemon to the offering client when a remote subscriber
+    subscribes to (or renews a subscription to) an eventgroup of a service the
+    client offers."""
+
+    service_id: int
+    instance_id: int
+    event_group_id: int
+    subscriber_ip: str
+    subscriber_port: int
+    ttl_seconds: int
+    is_renewal: bool
+
+
 T = TypeVar("T", bound=BaseMessage)
 
 
