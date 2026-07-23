@@ -1738,7 +1738,12 @@ class SomeipDaemon:
         pass
 
     async def start_sd_listening(self):
-        if self.sd_address.startswith("224"):
+        # Any address in the IPv4 multicast range (class D, 224.0.0.0/4, i.e.
+        # 224.x - 239.x) must join the multicast group. A prefix check of "224"
+        # only matched the 224.x block and sent other multicast groups (e.g.
+        # 239.x) down the broadcast path, which never issues IP_ADD_MEMBERSHIP,
+        # so offers multicast to those groups were never received.
+        if ipaddress.ip_address(self.sd_address).is_multicast:
             self._sd_socket_mcast = create_rcv_multicast_socket(
                 self.sd_address, self.sd_port, self.interface
             )
