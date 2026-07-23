@@ -415,6 +415,7 @@ def deserialize_sd_message(
                 instance_id=common_entry_data.instance_id,
                 major_version=common_entry_data.major_version,
                 minor_version=minor_version,
+                ttl=common_entry_data.ttl,
             )
             entries.append(find_service_entry)
 
