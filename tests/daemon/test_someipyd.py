@@ -13,6 +13,7 @@ from someipy._internal._daemon.daemon_server import ClientConnectedEventArgs
 from someipy._internal._daemon.daemon_server_client import DaemonServerClient
 from someipy._internal._daemon.subscription import Subscription
 from someipy._internal._daemon.uds_messages import (
+    InboundCallMethodResponse,
     OfferServiceRequest,
     SendEventRequest,
     StopOfferServiceRequest,
@@ -720,3 +721,77 @@ def test_send_event_does_not_log_error_when_endpoint_present(daemon):
         "server endpoint" in str(call.args[0])
         for call in daemon.logger.error.call_args_list
     )
+
+
+def _server_endpoint_mock(ip, port, protocol):
+    endpoint = MagicMock()
+    endpoint.src_ip.return_value = ip
+    endpoint.src_port.return_value = port
+    endpoint.protocol.return_value = protocol
+    return endpoint
+
+
+def test_method_response_uses_offered_service_endpoint_not_first(daemon: SomeipDaemon):
+    # One client offers two services on different ports. A method response for
+    # the second service must be sent from that service's own endpoint, not the
+    # first endpoint the client happens to have (which the peer would reject).
+    writer_id = 1
+
+    service_a = ServiceToOffer(
+        client_writer_id=writer_id,
+        instance_id=0x01,
+        service_id=0x1111,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.1"), 3000),
+        methods=[Method(id=1, protocol=TransportLayerProtocol.UDP)],
+        eventgroups=[],
+    )
+    service_b = ServiceToOffer(
+        client_writer_id=writer_id,
+        instance_id=0x02,
+        service_id=0x2222,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.1"), 3001),
+        methods=[Method(id=1, protocol=TransportLayerProtocol.UDP)],
+        eventgroups=[],
+    )
+    daemon._services_to_offer.add_service(service_a)
+    daemon._services_to_offer.add_service(service_b)
+
+    # Added in offering order: endpoint_a (port 3000) is first for this client,
+    # so the generic get_endpoint(writer_id, UDP) would return it.
+    endpoint_a = _server_endpoint_mock("127.0.0.1", 3000, TransportLayerProtocol.UDP)
+    endpoint_b = _server_endpoint_mock("127.0.0.1", 3001, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(writer_id, endpoint_a)
+    daemon._someip_server_endpoints.add_endpoint(writer_id, endpoint_b)
+
+    message = create_uds_message(
+        InboundCallMethodResponse,
+        service_id=0x2222,
+        instance_id=0x02,
+        method_id=1,
+        client_id=3,
+        session_id=4,
+        protocol_version=1,
+        interface_version=1,
+        major_version=1,
+        minor_version=0,
+        message_type=0x80,  # RESPONSE
+        src_endpoint_ip="127.0.0.50",
+        src_endpoint_port=40000,
+        protocol=TransportLayerProtocol.UDP.value,
+        payload="",
+        return_code=0x00,
+    )
+
+    daemon._handle_inbound_call_method_response(message, writer_id)
+
+    # The response must go out service B's endpoint (port 3001), not port 3000.
+    endpoint_b.sendto.assert_called_once()
+    endpoint_a.sendto.assert_not_called()
