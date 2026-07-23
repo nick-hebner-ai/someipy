@@ -187,8 +187,22 @@ def _eval_offer_method(someipy_lines, vsomeip_lines):
     return got_available and responses > 0 and received > 0
 
 
+def _eval_inbound_subscription(someipy_lines, vsomeip_lines):
+    # A vsomeip peer subscribes to an eventgroup someipy offers. someipy's daemon
+    # must notify the offering client with an InboundSubscription message, which
+    # the app prints. Before the fix the daemon ACKed the subscription but never
+    # told the client.
+    notifications = sum("InboundSubscription received" in l for l in someipy_lines)
+    print(f"  InboundSubscription notifications: {notifications}")
+    return notifications > 0
+
+
 TESTS = [
     Case("offer_method_udp", "offer_method_udp.py", "offer_method_udp", _eval_offer_method),
+    # A vsomeip peer subscribes to a someipy-offered eventgroup; the offering
+    # client must be notified. (The vsomeip "send_events" app is the subscriber.)
+    Case("inbound_subscription", "observe_inbound_subscriptions_udp.py", "send_events",
+         _eval_inbound_subscription),
 ]
 
 
