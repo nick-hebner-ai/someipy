@@ -189,6 +189,11 @@ def _eval_offer_method(someipy_lines, vsomeip_lines):
 
 TESTS = [
     Case("offer_method_udp", "offer_method_udp.py", "offer_method_udp", _eval_offer_method),
+    # someipy offers a decoy method service first, then the called service on a
+    # different port; the vsomeip caller targets the second service. Its
+    # responses must come from that service's own port to be accepted.
+    Case("multi_port_method_response", "offer_two_methods_udp.py", "offer_method_udp",
+         _eval_offer_method),
 ]
 
 
