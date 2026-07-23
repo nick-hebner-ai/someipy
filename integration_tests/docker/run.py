@@ -187,8 +187,21 @@ def _eval_offer_method(someipy_lines, vsomeip_lines):
     return got_available and responses > 0 and received > 0
 
 
+def _eval_fire_and_forget(someipy_lines, vsomeip_lines):
+    # vsomeip sends fire-and-forget (REQUEST_NO_RETURN) calls to a method
+    # someipy offers. someipy's handler must be invoked for each; no response is
+    # expected, so success is measured on the someipy side. Before the dispatch
+    # fix the daemon dropped REQUEST_NO_RETURN and the handler never ran.
+    got_available = any("is available" in l for l in vsomeip_lines)
+    sent = sum("sent a fire-and-forget request" in l for l in vsomeip_lines)
+    received = sum("Received data:" in l for l in someipy_lines)
+    print(f"  service available={got_available} sent={sent} handler_calls={received}")
+    return got_available and sent > 0 and received > 0
+
+
 TESTS = [
     Case("offer_method_udp", "offer_method_udp.py", "offer_method_udp", _eval_offer_method),
+    Case("fire_and_forget_udp", "offer_method_udp.py", "fire_and_forget_udp", _eval_fire_and_forget),
     # someipy offers a decoy method service first, then the called service on a
     # different port; the vsomeip caller targets the second service. Its
     # responses must come from that service's own port to be accepted.

@@ -28,6 +28,9 @@ from someipy._internal._sd.entries.offer_service_entry import OfferServiceEntry
 from someipy._internal._sd.options.endpoint import IpV4EndpointOption
 from someipy._internal._sd.service_instance import ServiceInstance
 from someipy._internal.someip_endpoint_factory import SomeipEndpointFactory
+from someipy._internal.message_types import MessageType
+from someipy._internal.someip_header import SomeIpHeader
+from someipy._internal.someip_message import SomeIpMessage
 from someipy._internal.transport_layer_protocol import TransportLayerProtocol
 from someipy.service import Event, EventGroup, Method
 from someipy.someipyd import DaemonServer, SomeipDaemon
@@ -527,6 +530,81 @@ def test_stop_subscribe_eventgroup_request_removes_pending_and_active_subscripti
 
     assert len(daemon._pending_subscriptions) == 0
     assert len(daemon._active_subscriptions) == 0
+
+
+@pytest.mark.parametrize(
+    "message_type",
+    [MessageType.REQUEST, MessageType.REQUEST_NO_RETURN],
+)
+@pytest.mark.asyncio
+async def test_someip_message_callback_dispatches_request_types_to_client(
+    daemon: SomeipDaemon,
+    offer_service_request: OfferServiceRequest,
+    message_type: MessageType,
+):
+    # A method call arriving for an offered service must be forwarded to the
+    # offering client. This must hold for both a normal REQUEST and a
+    # fire-and-forget REQUEST_NO_RETURN (the latter regressed before the fix:
+    # it fell through the dispatch and was silently dropped).
+    await daemon._handle_offer_service_request(offer_service_request, 1)
+    daemon._tx_queues[1] = asyncio.Queue()
+
+    # The offered service listens on 127.0.0.1:1 for method id 1 (see the
+    # offer_service_request fixture).
+    header = SomeIpHeader(
+        service_id=1,
+        method_id=1,
+        length=8,
+        client_id=3,
+        session_id=4,
+        protocol_version=1,
+        interface_version=2,
+        message_type=message_type.value,
+        return_code=0x00,
+    )
+    message = SomeIpMessage(header=header, payload=b"")
+
+    daemon._someip_message_callback(
+        message,
+        src_addr=("192.168.1.50", 30509),
+        dst_addr=("127.0.0.1", 1),
+        protocol=TransportLayerProtocol.UDP,
+    )
+
+    assert daemon._tx_queues[1].qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_someip_message_callback_ignores_request_for_unknown_service(
+    daemon: SomeipDaemon,
+    offer_service_request: OfferServiceRequest,
+):
+    # A fire-and-forget request whose destination endpoint does not match any
+    # offered service must not be dispatched.
+    await daemon._handle_offer_service_request(offer_service_request, 1)
+    daemon._tx_queues[1] = asyncio.Queue()
+
+    header = SomeIpHeader(
+        service_id=1,
+        method_id=1,
+        length=8,
+        client_id=3,
+        session_id=4,
+        protocol_version=1,
+        interface_version=2,
+        message_type=MessageType.REQUEST_NO_RETURN.value,
+        return_code=0x00,
+    )
+    message = SomeIpMessage(header=header, payload=b"")
+
+    daemon._someip_message_callback(
+        message,
+        src_addr=("192.168.1.50", 30509),
+        dst_addr=("127.0.0.1", 9999),  # wrong port -> no matching service
+        protocol=TransportLayerProtocol.UDP,
+    )
+
+    assert daemon._tx_queues[1].qsize() == 0
 
 
 def _subscribed_service_with_no_endpoint(daemon, protocol):
