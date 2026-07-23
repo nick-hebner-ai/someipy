@@ -20,6 +20,7 @@ into the daemon container, so whatever revision is checked out is what is tested
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -43,21 +44,36 @@ def _run(cmd, **kwargs):
 
 def ensure_network():
     existing = _run(["docker", "network", "ls", "--format", "{{.Name}}"]).stdout.split()
-    if NETWORK in existing:
-        return
-    result = _run(["docker", "network", "create", "--subnet", SUBNET, NETWORK])
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Could not create docker network {NETWORK} (subnet {SUBNET}); "
-            f"another network with an overlapping subnet may already exist.\n"
-            f"{result.stderr}"
-        )
+    if NETWORK not in existing:
+        result = _run(["docker", "network", "create", "--subnet", SUBNET, NETWORK])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not create docker network {NETWORK} (subnet {SUBNET}); "
+                f"another network with an overlapping subnet may already exist.\n"
+                f"{result.stderr}"
+            )
+    _disable_bridge_multicast_snooping()
 
 
-def someipyd_config() -> str:
+def _disable_bridge_multicast_snooping():
+    # Docker bridges enable IGMP snooping but run no querier, which makes
+    # multicast delivery between containers unreliable (group memberships are
+    # not maintained). Disable snooping so the bridge floods multicast, giving
+    # reliable Service Discovery delivery. Needs a privileged helper container
+    # to write the host sysfs entry.
+    net_id = _run(["docker", "network", "inspect", NETWORK, "-f", "{{.Id}}"]).stdout.strip()
+    bridge = f"br-{net_id[:12]}"
+    _run(
+        ["docker", "run", "--rm", "--privileged", "--network", "host",
+         "--entrypoint", "bash", IMAGE, "-c",
+         f"echo 0 > /sys/class/net/{bridge}/bridge/multicast_snooping"]
+    )
+
+
+def someipyd_config(sd_address=SD_MULTICAST) -> str:
     return (
         '{\n'
-        f'    "sd_address": "{SD_MULTICAST}",\n'
+        f'    "sd_address": "{sd_address}",\n'
         f'    "sd_port": {SD_PORT},\n'
         '    "log_level": "DEBUG",\n'
         f'    "interface": "{IP_SOMEIPY}",\n'
@@ -68,26 +84,35 @@ def someipyd_config() -> str:
     )
 
 
-def vsomeip_config() -> str:
-    return (
-        '{\n'
-        f'    "unicast": "{IP_VSOMEIP}",\n'
-        '    "logging": {"level": "verbose", "console": "true",\n'
-        '                "file": {"enable": "false"}, "dlt": "false"},\n'
-        '    "applications": [{"name": "Hello", "id": "0x1313"}],\n'
-        '    "routing": "Hello",\n'
-        '    "service-discovery": {\n'
-        '        "enable": "true",\n'
-        f'        "multicast": "{SD_MULTICAST}",\n'
-        f'        "port": "{SD_PORT}",\n'
-        '        "protocol": "udp",\n'
-        '        "initial_delay_min": "10", "initial_delay_max": "100",\n'
-        '        "repetitions_base_delay": "200", "repetitions_max": "3",\n'
-        '        "ttl": "3", "cyclic_offer_delay": "2000",\n'
-        '        "request_response_delay": "1500"\n'
-        '    }\n'
-        '}\n'
-    )
+def vsomeip_config(offers=None, sd_address=SD_MULTICAST) -> str:
+    # `offers`, when given, is a list of {"service","instance","unreliable"}
+    # dicts. vsomeip only multicasts OfferService for a service if the config
+    # declares its port here; without it vsomeip treats the offer as internal
+    # and never puts it on the wire. Client-role peers pass no offers.
+    cfg = {
+        "unicast": IP_VSOMEIP,
+        "logging": {"level": "verbose", "console": "true",
+                    "file": {"enable": "false"}, "dlt": "false"},
+        "applications": [{"name": "Hello", "id": "0x1313"}],
+        "routing": "Hello",
+        "service-discovery": {
+            "enable": "true",
+            "multicast": sd_address,
+            "port": str(SD_PORT),
+            "protocol": "udp",
+            "initial_delay_min": "10", "initial_delay_max": "100",
+            "repetitions_base_delay": "200", "repetitions_max": "3",
+            "ttl": "3", "cyclic_offer_delay": "2000",
+            "request_response_delay": "1500",
+        },
+    }
+    if offers:
+        cfg["services"] = [
+            {"service": o["service"], "instance": o["instance"],
+             "unreliable": o["unreliable"]}
+            for o in offers
+        ]
+    return json.dumps(cfg, indent=4)
 
 
 class Case:
@@ -97,11 +122,16 @@ class Case:
     captured stdout of each side.
     """
 
-    def __init__(self, name, someipy_app, vsomeip_app, evaluate):
+    def __init__(self, name, someipy_app, vsomeip_app, evaluate,
+                 vsomeip_offers=None, sd_address=SD_MULTICAST):
         self.name = name
         self.someipy_app = someipy_app  # file under example_apps/
         self.vsomeip_app = vsomeip_app  # installed dir/binary name
         self.evaluate = evaluate
+        # Services the vsomeip peer should offer on the network (server-role
+        # tests). Each is {"service","instance","unreliable"}. None = client.
+        self.vsomeip_offers = vsomeip_offers
+        self.sd_address = sd_address  # SD multicast group for this case
 
 
 def run_case(case: "Case", duration: int, keep: bool) -> bool:
@@ -116,9 +146,9 @@ def run_case(case: "Case", duration: int, keep: bool) -> bool:
         os.makedirs(cfg_dir)
         os.makedirs(logs_dir)
         with open(os.path.join(cfg_dir, "someipyd.json"), "w") as f:
-            f.write(someipyd_config())
+            f.write(someipyd_config(case.sd_address))
         with open(os.path.join(cfg_dir, "vsomeip-client.json"), "w") as f:
-            f.write(vsomeip_config())
+            f.write(vsomeip_config(case.vsomeip_offers, case.sd_address))
 
         someipy_cmd = (
             "PYTHONPATH=/work/src python3 /work/src/someipy/someipyd.py "
@@ -130,7 +160,7 @@ def run_case(case: "Case", duration: int, keep: bool) -> bool:
         # vsomeip needs a route covering the SD multicast group before its
         # Service Discovery will start (sd_wait_route).
         vsomeip_cmd = (
-            f"ip route add {SD_MULTICAST}/32 dev eth0 || ip route add 224.0.0.0/4 dev eth0; "
+            "ip route add 224.0.0.0/4 dev eth0; "
             "sleep 3; "
             "VSOMEIP_CONFIGURATION=/cfg/vsomeip-client.json "
             f"/opt/integration_tests/install/{case.vsomeip_app}/{case.vsomeip_app} --udp "
@@ -187,8 +217,40 @@ def _eval_offer_method(someipy_lines, vsomeip_lines):
     return got_available and responses > 0 and received > 0
 
 
+def _eval_fire_and_forget(someipy_lines, vsomeip_lines):
+    # vsomeip sends fire-and-forget (REQUEST_NO_RETURN) calls to a method
+    # someipy offers. someipy's handler must be invoked for each; no response is
+    # expected, so success is measured on the someipy side. Before the dispatch
+    # fix the daemon dropped REQUEST_NO_RETURN and the handler never ran.
+    got_available = any("is available" in l for l in vsomeip_lines)
+    sent = sum("sent a fire-and-forget request" in l for l in vsomeip_lines)
+    received = sum("Received data:" in l for l in someipy_lines)
+    print(f"  service available={got_available} sent={sent} handler_calls={received}")
+    return got_available and sent > 0 and received > 0
+
+
+def _eval_discovery(someipy_lines, vsomeip_lines):
+    # someipy (client) must discover a service a vsomeip peer offers over
+    # multicast SD and call its method. This requires the daemon's multicast
+    # receive socket to actually receive the peer's offers.
+    called = sum("Sum:" in l for l in someipy_lines)
+    print(f"  successful method results (implies discovery): {called}")
+    return called > 0
+
+
 TESTS = [
     Case("offer_method_udp", "offer_method_udp.py", "offer_method_udp", _eval_offer_method),
+    Case("fire_and_forget_udp", "offer_method_udp.py", "fire_and_forget_udp", _eval_fire_and_forget),
+    # someipy (client) discovers a vsomeip-offered service on a NON-224 (239.x)
+    # multicast SD group. The daemon only joins that group -- and thus receives
+    # the offer -- if it treats the full class-D range as multicast; before the
+    # fix a "224" prefix check sent 239.x down the broadcast path (no join), so
+    # discovery never happened. vsomeip is the server (offers the service).
+    Case("non224_discovery_udp", "call_method_udp.py", "call_method_udp",
+         _eval_discovery,
+         vsomeip_offers=[{"service": "0x1234", "instance": "0x5678",
+                          "unreliable": "30509"}],
+         sd_address="239.192.0.251"),
 ]
 
 

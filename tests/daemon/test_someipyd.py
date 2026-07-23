@@ -2,7 +2,9 @@ from asyncio import DatagramTransport
 import asyncio
 import base64
 import ipaddress
+import json
 import logging
+import struct
 import time
 import pytest
 import pytest_asyncio
@@ -13,6 +15,7 @@ from someipy._internal._daemon.daemon_server import ClientConnectedEventArgs
 from someipy._internal._daemon.daemon_server_client import DaemonServerClient
 from someipy._internal._daemon.subscription import Subscription
 from someipy._internal._daemon.uds_messages import (
+    InboundCallMethodResponse,
     OfferServiceRequest,
     SendEventRequest,
     StopOfferServiceRequest,
@@ -27,6 +30,10 @@ from someipy._internal._sd.entries.offer_service_entry import OfferServiceEntry
 from someipy._internal._sd.options.endpoint import IpV4EndpointOption
 from someipy._internal._sd.service_instance import ServiceInstance
 from someipy._internal.someip_endpoint_factory import SomeipEndpointFactory
+from someipy._internal.message_types import MessageType
+from someipy._internal.someip_header import SomeIpHeader
+from someipy._internal.someip_message import SomeIpMessage
+from someipy._internal.someip_sd_header import SdSubscription
 from someipy._internal.transport_layer_protocol import TransportLayerProtocol
 from someipy.service import Event, EventGroup, Method
 from someipy.someipyd import DaemonServer, SomeipDaemon
@@ -528,6 +535,81 @@ def test_stop_subscribe_eventgroup_request_removes_pending_and_active_subscripti
     assert len(daemon._active_subscriptions) == 0
 
 
+@pytest.mark.parametrize(
+    "message_type",
+    [MessageType.REQUEST, MessageType.REQUEST_NO_RETURN],
+)
+@pytest.mark.asyncio
+async def test_someip_message_callback_dispatches_request_types_to_client(
+    daemon: SomeipDaemon,
+    offer_service_request: OfferServiceRequest,
+    message_type: MessageType,
+):
+    # A method call arriving for an offered service must be forwarded to the
+    # offering client. This must hold for both a normal REQUEST and a
+    # fire-and-forget REQUEST_NO_RETURN (the latter regressed before the fix:
+    # it fell through the dispatch and was silently dropped).
+    await daemon._handle_offer_service_request(offer_service_request, 1)
+    daemon._tx_queues[1] = asyncio.Queue()
+
+    # The offered service listens on 127.0.0.1:1 for method id 1 (see the
+    # offer_service_request fixture).
+    header = SomeIpHeader(
+        service_id=1,
+        method_id=1,
+        length=8,
+        client_id=3,
+        session_id=4,
+        protocol_version=1,
+        interface_version=2,
+        message_type=message_type.value,
+        return_code=0x00,
+    )
+    message = SomeIpMessage(header=header, payload=b"")
+
+    daemon._someip_message_callback(
+        message,
+        src_addr=("192.168.1.50", 30509),
+        dst_addr=("127.0.0.1", 1),
+        protocol=TransportLayerProtocol.UDP,
+    )
+
+    assert daemon._tx_queues[1].qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_someip_message_callback_ignores_request_for_unknown_service(
+    daemon: SomeipDaemon,
+    offer_service_request: OfferServiceRequest,
+):
+    # A fire-and-forget request whose destination endpoint does not match any
+    # offered service must not be dispatched.
+    await daemon._handle_offer_service_request(offer_service_request, 1)
+    daemon._tx_queues[1] = asyncio.Queue()
+
+    header = SomeIpHeader(
+        service_id=1,
+        method_id=1,
+        length=8,
+        client_id=3,
+        session_id=4,
+        protocol_version=1,
+        interface_version=2,
+        message_type=MessageType.REQUEST_NO_RETURN.value,
+        return_code=0x00,
+    )
+    message = SomeIpMessage(header=header, payload=b"")
+
+    daemon._someip_message_callback(
+        message,
+        src_addr=("192.168.1.50", 30509),
+        dst_addr=("127.0.0.1", 9999),  # wrong port -> no matching service
+        protocol=TransportLayerProtocol.UDP,
+    )
+
+    assert daemon._tx_queues[1].qsize() == 0
+
+
 def _subscribed_service_with_no_endpoint(daemon, protocol):
     """Set up an offered service with one subscriber but no matching server
     endpoint, and return the SendEventRequest that targets it. Sending the
@@ -642,6 +724,165 @@ def test_send_event_does_not_log_error_when_endpoint_present(daemon):
         "server endpoint" in str(call.args[0])
         for call in daemon.logger.error.call_args_list
     )
+
+
+def _server_endpoint_mock(ip, port, protocol):
+    endpoint = MagicMock()
+    endpoint.src_ip.return_value = ip
+    endpoint.src_port.return_value = port
+    endpoint.protocol.return_value = protocol
+    return endpoint
+
+
+def test_method_response_uses_offered_service_endpoint_not_first(daemon: SomeipDaemon):
+    # One client offers two services on different ports. A method response for
+    # the second service must be sent from that service's own endpoint, not the
+    # first endpoint the client happens to have (which the peer would reject).
+    writer_id = 1
+
+    service_a = ServiceToOffer(
+        client_writer_id=writer_id,
+        instance_id=0x01,
+        service_id=0x1111,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.1"), 3000),
+        methods=[Method(id=1, protocol=TransportLayerProtocol.UDP)],
+        eventgroups=[],
+    )
+    service_b = ServiceToOffer(
+        client_writer_id=writer_id,
+        instance_id=0x02,
+        service_id=0x2222,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.1"), 3001),
+        methods=[Method(id=1, protocol=TransportLayerProtocol.UDP)],
+        eventgroups=[],
+    )
+    daemon._services_to_offer.add_service(service_a)
+    daemon._services_to_offer.add_service(service_b)
+
+    # Added in offering order: endpoint_a (port 3000) is first for this client,
+    # so the generic get_endpoint(writer_id, UDP) would return it.
+    endpoint_a = _server_endpoint_mock("127.0.0.1", 3000, TransportLayerProtocol.UDP)
+    endpoint_b = _server_endpoint_mock("127.0.0.1", 3001, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(writer_id, endpoint_a)
+    daemon._someip_server_endpoints.add_endpoint(writer_id, endpoint_b)
+
+    message = create_uds_message(
+        InboundCallMethodResponse,
+        service_id=0x2222,
+        instance_id=0x02,
+        method_id=1,
+        client_id=3,
+        session_id=4,
+        protocol_version=1,
+        interface_version=1,
+        major_version=1,
+        minor_version=0,
+        message_type=0x80,  # RESPONSE
+        src_endpoint_ip="127.0.0.50",
+        src_endpoint_port=40000,
+        protocol=TransportLayerProtocol.UDP.value,
+        payload="",
+        return_code=0x00,
+    )
+
+    daemon._handle_inbound_call_method_response(message, writer_id)
+
+    # The response must go out service B's endpoint (port 3001), not port 3000.
+    endpoint_b.sendto.assert_called_once()
+    endpoint_a.sendto.assert_not_called()
+
+
+def _decode_client_message(framed: bytes) -> dict:
+    # prepare_message frames a message as: 4-byte little-endian payload length,
+    # then padding out to a 256-byte header, then the JSON payload.
+    length = struct.unpack("<I", framed[:4])[0]
+    return json.loads(framed[256 : 256 + length].decode("utf-8"))
+
+
+def _offer_service_for_subscription(daemon, writer_id):
+    service = ServiceToOffer(
+        client_writer_id=writer_id,
+        instance_id=0x5678,
+        service_id=0x1234,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.1"), 3000),
+        methods=[],
+        eventgroups=[EventGroup(id=0x0003, events=[Event(id=1, protocol=TransportLayerProtocol.UDP)])],
+    )
+    daemon._services_to_offer.add_service(service)
+
+
+def _subscription():
+    return SdSubscription(
+        service_id=0x1234,
+        instance_id=0x5678,
+        major_version=1,
+        ttl=10,
+        initial_data_requested_flag=0,
+        counter=0,
+        eventgroup_id=0x0003,
+        ipv4_address=ipaddress.IPv4Address("192.168.1.50"),
+        port=30509,
+        protocol=TransportLayerProtocol.UDP,
+    )
+
+
+def test_subscription_notifies_offering_client(daemon: SomeipDaemon):
+    # When a remote subscriber subscribes to an offered service, the offering
+    # client is notified with an InboundSubscription message.
+    writer_id = 1
+    _offer_service_for_subscription(daemon, writer_id)
+    daemon._tx_queues[writer_id] = asyncio.Queue()
+
+    daemon._handle_subscription(_subscription())
+
+    assert daemon._tx_queues[writer_id].qsize() == 1
+    msg = _decode_client_message(daemon._tx_queues[writer_id].get_nowait())
+    assert msg["type"] == "InboundSubscription"
+    assert msg["service_id"] == 0x1234
+    assert msg["instance_id"] == 0x5678
+    assert msg["event_group_id"] == 0x0003
+    assert msg["subscriber_ip"] == "192.168.1.50"
+    assert msg["subscriber_port"] == 30509
+    assert msg["ttl_seconds"] == 10
+    assert msg["is_renewal"] is False
+
+
+def test_subscription_renewal_is_flagged(daemon: SomeipDaemon):
+    # The same subscriber subscribing again is reported as a renewal.
+    writer_id = 1
+    _offer_service_for_subscription(daemon, writer_id)
+    daemon._tx_queues[writer_id] = asyncio.Queue()
+
+    daemon._handle_subscription(_subscription())
+    daemon._handle_subscription(_subscription())
+
+    messages = [
+        _decode_client_message(daemon._tx_queues[writer_id].get_nowait())
+        for _ in range(daemon._tx_queues[writer_id].qsize())
+    ]
+    assert [m["is_renewal"] for m in messages] == [False, True]
+
+
+def test_subscription_without_matching_offer_sends_no_notification(daemon: SomeipDaemon):
+    # A subscription for a service this daemon does not offer notifies nobody.
+    writer_id = 1
+    daemon._tx_queues[writer_id] = asyncio.Queue()
+
+    daemon._handle_subscription(_subscription())  # no service offered
+
+    assert daemon._tx_queues[writer_id].qsize() == 0
 
 
 @pytest.mark.parametrize(
