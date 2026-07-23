@@ -1192,6 +1192,18 @@ class SomeipDaemon:
                                 endpoint.sendto(
                                     someip_message.serialize(), subscriber.endpoint
                                 )
+                            else:
+                                self.logger.error(
+                                    "Dropping event for service 0x%04x: "
+                                    "no UDP server endpoint for %s:%s. Known endpoints: %s",
+                                    offered_service.service_id,
+                                    message["src_endpoint_ip"],
+                                    message["src_endpoint_port"],
+                                    [
+                                        (e.src_ip(), e.src_port())
+                                        for e in self._someip_server_endpoints.get_all_endpoints()
+                                    ],
+                                )
 
                         elif deserialized_event.protocol == TransportLayerProtocol.TCP:
 
@@ -1221,6 +1233,18 @@ class SomeipDaemon:
                                 )
                                 endpoint.sendto(
                                     someip_message.serialize(), subscriber.endpoint
+                                )
+                            else:
+                                self.logger.error(
+                                    "Dropping event for service 0x%04x: "
+                                    "no TCP server endpoint for %s:%s. Known endpoints: %s",
+                                    offered_service.service_id,
+                                    message["src_endpoint_ip"],
+                                    message["src_endpoint_port"],
+                                    [
+                                        (e.src_ip(), e.src_port())
+                                        for e in self._someip_server_endpoints.get_all_endpoints()
+                                    ],
                                 )
 
         # Handle internal subscriptions (UDS clients)

@@ -238,7 +238,11 @@ def serialize_sd_message(sd_message: SdMessage) -> bytes:
                 ttl_low,
             )
 
-            initial_data_requested_flag_counter_value = set_bit_at_position(0, 7, True)
+            # Bit 7 of this reserved/flags byte is the (deprecated) "initial
+            # data requested" flag. This entry type carries no such field, so
+            # leave the reserved field zero: strict SD stacks discard
+            # SubscribeEventgroup entries whose reserved field is non-zero.
+            initial_data_requested_flag_counter_value = set_bit_at_position(0, 7, False)
             initial_data_requested_flag_counter_value = (
                 initial_data_requested_flag_counter_value | (entry.counter & 0xF)
             )

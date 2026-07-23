@@ -1,5 +1,6 @@
 from asyncio import DatagramTransport
 import asyncio
+import base64
 import ipaddress
 import logging
 import time
@@ -13,11 +14,14 @@ from someipy._internal._daemon.daemon_server_client import DaemonServerClient
 from someipy._internal._daemon.subscription import Subscription
 from someipy._internal._daemon.uds_messages import (
     OfferServiceRequest,
+    SendEventRequest,
     StopOfferServiceRequest,
     StopSubscribeEventGroupRequest,
     SubscribeEventGroupRequest,
     create_uds_message,
 )
+from someipy._internal._daemon.offer_service_storage import ServiceToOffer
+from someipy._internal.subscribers import EventGroupSubscriber, Subscribers
 from someipy._internal._sd.deserialization.sd_serialization import serialize_sd_message
 from someipy._internal._sd.entries.offer_service_entry import OfferServiceEntry
 from someipy._internal._sd.options.endpoint import IpV4EndpointOption
@@ -600,3 +604,119 @@ async def test_someip_message_callback_ignores_request_for_unknown_service(
     )
 
     assert daemon._tx_queues[1].qsize() == 0
+
+
+def _subscribed_service_with_no_endpoint(daemon, protocol):
+    """Set up an offered service with one subscriber but no matching server
+    endpoint, and return the SendEventRequest that targets it. Sending the
+    event must find the subscriber but no endpoint to send from."""
+    event = Event(id=0x0001, protocol=protocol)
+    eventgroup = EventGroup(id=0x0003, events=[event])
+    service = ServiceToOffer(
+        client_writer_id=1,
+        instance_id=0x5678,
+        service_id=0x1234,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.2"), 3000),
+        methods=[],
+        eventgroups=[eventgroup],
+    )
+    subscribers = Subscribers()
+    subscribers.add_subscriber(
+        EventGroupSubscriber(
+            eventgroup_id=0x0003, endpoint=("127.0.0.1", 40000), ttl=0xFFFFFF
+        )
+    )
+    daemon._service_subscribers[service] = subscribers
+
+    message = create_uds_message(
+        SendEventRequest,
+        service_id=0x1234,
+        instance_id=0x5678,
+        major_version=1,
+        client_id=1,
+        session_id=1,
+        eventgroup_id=0x0003,
+        event=event.to_json(),
+        src_endpoint_ip="127.0.0.9",  # no server endpoint has this ip/port
+        src_endpoint_port=9999,
+        payload=base64.b64encode(b"\x00\x00\x00\x01").decode("utf-8"),
+    )
+    return message
+
+
+@pytest.mark.parametrize(
+    "protocol, expected",
+    [
+        (TransportLayerProtocol.UDP, "no UDP server endpoint"),
+        (TransportLayerProtocol.TCP, "no TCP server endpoint"),
+    ],
+)
+def test_send_event_logs_error_when_no_server_endpoint(daemon, protocol, expected):
+    # A subscriber exists but there is no matching server endpoint, so the event
+    # cannot be sent. This must be logged rather than silently dropped.
+    message = _subscribed_service_with_no_endpoint(daemon, protocol)
+
+    daemon._handle_send_event_request(message, 1)
+
+    assert daemon.logger.error.called
+    assert any(
+        expected in str(call.args[0]) for call in daemon.logger.error.call_args_list
+    )
+
+
+def test_send_event_does_not_log_error_when_endpoint_present(daemon):
+    # When a matching server endpoint exists, the event is sent and no
+    # endpoint-not-found error is logged.
+    event = Event(id=0x0001, protocol=TransportLayerProtocol.UDP)
+    eventgroup = EventGroup(id=0x0003, events=[event])
+    service = ServiceToOffer(
+        client_writer_id=1,
+        instance_id=0x5678,
+        service_id=0x1234,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.2"), 3000),
+        methods=[],
+        eventgroups=[eventgroup],
+    )
+    subscribers = Subscribers()
+    subscribers.add_subscriber(
+        EventGroupSubscriber(
+            eventgroup_id=0x0003, endpoint=("127.0.0.1", 40000), ttl=0xFFFFFF
+        )
+    )
+    daemon._service_subscribers[service] = subscribers
+
+    endpoint = MagicMock()
+    endpoint.src_ip.return_value = "127.0.0.9"
+    endpoint.src_port.return_value = 9999
+    endpoint.protocol.return_value = TransportLayerProtocol.UDP
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+
+    message = create_uds_message(
+        SendEventRequest,
+        service_id=0x1234,
+        instance_id=0x5678,
+        major_version=1,
+        client_id=1,
+        session_id=1,
+        eventgroup_id=0x0003,
+        event=event.to_json(),
+        src_endpoint_ip="127.0.0.9",
+        src_endpoint_port=9999,
+        payload=base64.b64encode(b"\x00\x00\x00\x01").decode("utf-8"),
+    )
+
+    daemon._handle_send_event_request(message, 1)
+
+    endpoint.sendto.assert_called_once()
+    assert not any(
+        "server endpoint" in str(call.args[0])
+        for call in daemon.logger.error.call_args_list
+    )

@@ -24,15 +24,18 @@ class SomeipEndpointStorage:
 
     def add_endpoint(self, client_id: int, endpoint: SomeipEndpoint) -> bool:
         """
-        Add an endpoint for a client ID.
-        Returns True if added successfully, False if client already has 2 endpoints.
+        Add an endpoint for a client ID. Always returns True.
+
+        A client needs one endpoint per distinct port it offers on, so the
+        endpoint count is bounded by the client's own service configuration.
+        The previous fixed limit of 2 (one UDP + one TCP) silently rejected the
+        third and any further endpoint, breaking clients that offer on 3+ ports.
+        There is no fixed cap: callers already avoid duplicates via
+        has_endpoint(), and the OS bounds real socket/fd usage.
         """
         if client_id not in self._storage:
             self._storage[client_id] = [endpoint]
             return True
-
-        if len(self._storage[client_id]) >= 2:
-            return False
 
         self._storage[client_id].append(endpoint)
         return True

@@ -166,7 +166,13 @@ class SdEventGroupEntry:
         return cls(sd_entry, initial_data_requested_flag, counter, eventgroup_id)
 
     def to_buffer(self) -> bytes:
-        initial_data_requested_flag_counter_value = set_bit_at_position(0, 7, True)
+        # Bit 7 of this reserved/flags byte is the (deprecated) "initial data
+        # requested" flag. Honor the entry's own flag instead of hardcoding it
+        # set: strict SD stacks require the reserved field to be zero and
+        # discard SubscribeEventgroup entries that leave it set.
+        initial_data_requested_flag_counter_value = set_bit_at_position(
+            0, 7, bool(self.initial_data_requested_flag)
+        )
         initial_data_requested_flag_counter_value = (
             initial_data_requested_flag_counter_value | (self.counter & 0xF)
         )
