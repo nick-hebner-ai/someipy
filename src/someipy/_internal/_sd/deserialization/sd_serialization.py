@@ -145,10 +145,14 @@ def serialize_sd_message(sd_message: SdMessage) -> bytes:
             SdEntryType.STOP_OFFER_SERVICE,
             SdEntryType.FIND_SERVICE,
         ]:
-            if entry.type == SdEntryType.OFFER_SERVICE:
-                ttl = entry.ttl
-            else:
+            if entry.type == SdEntryType.STOP_OFFER_SERVICE:
+                # StopOfferService is an OfferService entry with TTL 0.
                 ttl = 0
+            else:
+                # OfferService and FindService both carry their own TTL. A
+                # FindService must be sent with TTL > 0, otherwise spec-
+                # compliant peers treat it as a "stop" entry and ignore it.
+                ttl = entry.ttl
 
             ttl_high = (ttl & 0xFF0000) >> 16
             ttl_low = ttl & 0xFFFF

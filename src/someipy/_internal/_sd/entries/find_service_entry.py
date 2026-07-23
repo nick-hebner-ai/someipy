@@ -25,6 +25,7 @@ class FindServiceEntry(SdEntry):
     instance_id: int
     major_version: int
     minor_version: int
+    ttl: int
 
     def __init__(
         self,
@@ -32,9 +33,16 @@ class FindServiceEntry(SdEntry):
         instance_id: int,
         major_version: int,
         minor_version: int,
+        ttl: int = 0xFFFFFF,
     ):
         super().__init__(SdEntryType.FIND_SERVICE)
         self.service_id = service_id
         self.instance_id = instance_id
         self.major_version = major_version
         self.minor_version = minor_version
+        # The TTL of a FindService entry states how long the query is valid.
+        # It must be > 0: per the SOME/IP-SD spec a TTL of 0 marks a "stop"
+        # entry, so spec-compliant peers (e.g. vsomeip) ignore a FindService
+        # with TTL 0 and never answer it. Default to 0xFFFFFF ("until
+        # stopped"), the same sentinel someipy uses elsewhere for TTLs.
+        self.ttl = ttl

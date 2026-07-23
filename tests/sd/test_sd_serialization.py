@@ -1,10 +1,14 @@
 import ipaddress
 
+from someipy._internal._sd.deserialization.sd_deserialization import (
+    deserialize_sd_message,
+)
 from someipy._internal._sd.deserialization.sd_serialization import (
     serialize_ipv4_endpoint_option,
     serialize_ipv6_endpoint_option,
     serialize_sd_message,
 )
+from someipy._internal._sd.entries.find_service_entry import FindServiceEntry
 from someipy._internal._sd.entries.offer_service_entry import OfferServiceEntry
 from someipy._internal._sd.options.endpoint import (
     IpV4EndpointOption,
@@ -129,6 +133,73 @@ def test_serialize_sd_message_with_one_offer_service_entry_without_options():
 
     assert len(data) == len(expected_data)
     assert data == expected_data
+
+
+def test_serialize_sd_message_with_one_find_service_entry():
+    # A FindService entry must be serialized with a non-zero TTL. A TTL of 0
+    # marks a "stop" entry in SOME/IP-SD, so a spec-compliant peer (e.g.
+    # vsomeip) silently ignores a FindService sent with TTL 0 and never
+    # answers it. The default TTL is 0xFFFFFF ("valid until stopped").
+    sd_message = SdMessage()
+    sd_message.multicast = True
+    sd_message.session_id = 0x1234
+
+    sd_message.entries.append(
+        FindServiceEntry(
+            service_id=0x01,
+            instance_id=0x02,
+            major_version=0x03,
+            minor_version=0x04,
+        )
+    )
+
+    data = serialize_sd_message(sd_message)
+
+    # fmt: off
+    expected_data = bytes(
+        [
+            0xFF, 0xFF, 0x81, 0x00,
+            0x00, 0x00, 0x00, 0x24, # length: 36
+            0x00, 0x00, 0x12, 0x34,
+            0x01, 0x01, 0x02, 0x00,
+            0x40, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10, # length entries: 16
+            0x00, 0x00, 0x00, 0x00, # entry type 0x00 = FindService, no options
+            0x00, 0x01, 0x00, 0x02,
+            0x03, 0xFF, 0xFF, 0xFF, # major 0x03, ttl 0xFFFFFF (must not be 0)
+            0x00, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x00, 0x00]) # length of options: 0
+    # fmt: on
+
+    assert len(data) == len(expected_data)
+    assert data == expected_data
+
+
+def test_find_service_entry_ttl_round_trips():
+    # The TTL set on a FindService entry survives serialize -> deserialize.
+    sd_message = SdMessage()
+    sd_message.multicast = True
+    sd_message.session_id = 0x1234
+    sd_message.entries.append(
+        FindServiceEntry(
+            service_id=0x11,
+            instance_id=0x22,
+            major_version=0x01,
+            minor_version=0xFFFFFFFF,
+            ttl=0x0000A5,
+        )
+    )
+
+    restored = deserialize_sd_message(
+        serialize_sd_message(sd_message), "127.0.0.1", 30490, True
+    )
+
+    assert len(restored.entries) == 1
+    entry = restored.entries[0]
+    assert isinstance(entry, FindServiceEntry)
+    assert entry.ttl == 0x0000A5
+    assert entry.service_id == 0x11
+    assert entry.instance_id == 0x22
 
 
 def test_serialize_sd_message_with_one_offer_service_entry_with_two_options():

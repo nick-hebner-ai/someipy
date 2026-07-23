@@ -42,6 +42,7 @@ from someipy._internal._sd.deserialization.sd_deserialization import (
 )
 from someipy._internal._sd.deserialization.sd_serialization import serialize_sd_message
 from someipy._internal._sd.entries.offer_service_entry import OfferServiceEntry
+from someipy._internal._sd.entries.find_service_entry import FindServiceEntry
 from someipy._internal._sd.entries.stop_subscribe_eventgroup_entry import (
     StopSubscribeEventGroupEntry,
 )
@@ -201,6 +202,10 @@ class SomeipDaemon:
         self._someip_client_endpoints = SomeipEndpointStorage()
 
         self._ttl_task: asyncio.Task = None
+
+        # Background find-service probe tasks, kept referenced so they are not
+        # garbage-collected while running.
+        self._background_tasks: Set[asyncio.Task] = set()
 
         self._issued_method_calls: Dict[MethodCall, int] = {}
 
@@ -1073,9 +1078,67 @@ class SomeipDaemon:
             (message["dst_endpoint_ip"], message["dst_endpoint_port"]),
         )
 
-    def _handle_find_service_request(self, message: FindServiceRequest, writer_id: int):
+    def _find_request_matches(
+        self, message: FindServiceRequest, service: ServiceInstance
+    ) -> bool:
+        """Whether a FindService request matches a service instance.
 
-        service_found = False
+        Per the SD spec, instance id 0xFFFF, major version 0xFF and minor
+        version 0xFFFFFFFF are wildcards.
+        """
+        return (
+            (message["service_id"] == service.service_id)
+            and (
+                message["instance_id"] == service.instance_id
+                or message["instance_id"] == 0xFFFF
+            )
+            and (
+                message["major_version"] == service.major_version
+                or message["major_version"] == 0xFF
+            )
+            and (
+                message["minor_version"] == service.minor_version
+                or message["minor_version"] == 0xFFFFFFFF
+            )
+        )
+
+    def _send_find_service_success(
+        self, writer_id: int, service: ServiceInstance
+    ) -> None:
+        response = create_uds_message(
+            FindServiceResponse,
+            success=True,
+            service_id=service.service_id,
+            instance_id=service.instance_id,
+            major_version=service.major_version,
+            minor_version=service.minor_version,
+            endpoint_ip=str(service.endpoint.ip),
+            endpoint_port=service.endpoint.port,
+        )
+        tx_queue = self._tx_queues.get(writer_id)
+        if tx_queue:
+            tx_queue.put_nowait(self.prepare_message(response))
+
+    def _send_find_service_failure(
+        self, writer_id: int, message: FindServiceRequest
+    ) -> None:
+        response = create_uds_message(
+            FindServiceResponse,
+            success=False,
+            service_id=message["service_id"],
+            instance_id=message["instance_id"],
+            major_version=message["major_version"],
+            minor_version=message["minor_version"],
+            endpoint_ip="empty",
+            endpoint_port=0,
+        )
+        tx_queue = self._tx_queues.get(writer_id)
+        if tx_queue:
+            tx_queue.put_nowait(self.prepare_message(response))
+
+    async def _handle_find_service_request(
+        self, message: FindServiceRequest, writer_id: int
+    ):
         all_services = [s for s in self._found_services]
 
         for service in self._services_to_offer.get_all_services():
@@ -1099,66 +1162,56 @@ class SomeipDaemon:
             all_services.append(service_to_add)
 
         for found_service in all_services:
-            """
-            • Instance ID shall be set to 0xFFFF, if all service instances shall be returned. It
-            shall be set to the Instance ID of a specific service instance, if just a single service
-            instance shall be returned.
-            • Major Version shall be set to 0xFF, that means that services with any version shall
-            be returned. If set to value different than 0xFF, services with this specific major
-            version shall be returned only.
-            • Minor Version shall be set to 0xFFFF FFFF, that means that services with any
-            version shall be returned. If set to a value different to 0xFFFF FFFF, services
-            with this specific minor version shall be returned only
-            """
+            if self._find_request_matches(message, found_service):
+                self._send_find_service_success(writer_id, found_service)
+                return
 
-            if (
-                (message["service_id"] == found_service.service_id)
-                and (
-                    message["instance_id"] == found_service.instance_id
-                    or message["instance_id"] == 0xFFFF
-                )
-                and (
-                    message["major_version"] == found_service.major_version
-                    or message["major_version"] == 0xFF
-                )
-                and (
-                    message["minor_version"] == found_service.minor_version
-                    or message["minor_version"] == 0xFFFFFFFF
-                )
-            ):
-                service_found = True
-                response = create_uds_message(
-                    FindServiceResponse,
-                    success=True,
-                    service_id=found_service.service_id,
-                    instance_id=found_service.instance_id,
-                    major_version=found_service.major_version,
-                    minor_version=found_service.minor_version,
-                    endpoint_ip=str(found_service.endpoint.ip),
-                    endpoint_port=found_service.endpoint.port,
-                )
+        # Not in the passive cache. someipyd otherwise only learns of services
+        # from unsolicited OfferService multicasts, so once a cached offer's TTL
+        # expires it is never replaced. Actively probe for the service by
+        # sending an SD FindService and polling the cache. Run it as a
+        # background task: the handler returns immediately so the probe's sleeps
+        # never block the event loop (which would delay cyclic OfferService for
+        # our own offered services and cause spurious TTL expiry on receivers).
+        task = asyncio.create_task(self._probe_find_service(message, writer_id))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
-                tx_queue = self._tx_queues.get(writer_id)
-                if tx_queue:
-                    tx_queue.put_nowait(self.prepare_message(response))
-
-                break
-
-        if not service_found:
-            response = create_uds_message(
-                FindServiceResponse,
-                success=False,
-                service_id=message["service_id"],
-                instance_id=message["instance_id"],
-                major_version=message["major_version"],
-                minor_version=message["minor_version"],
-                endpoint_ip="empty",
-                endpoint_port=0,
+    async def _probe_find_service(
+        self,
+        message: FindServiceRequest,
+        writer_id: int,
+        attempts: int = 4,
+        interval_s: float = 0.3,
+    ) -> None:
+        for _ in range(attempts):
+            session_id, reboot_flag = self._mcast_session_handler.update_session()
+            find_message = SdMessage()
+            find_message.session_id = session_id
+            find_message.reboot_flag = reboot_flag
+            find_message.entries.append(
+                FindServiceEntry(
+                    service_id=message["service_id"],
+                    instance_id=message["instance_id"],
+                    major_version=message["major_version"],
+                    minor_version=message["minor_version"],
+                )
             )
+            if self._ucast_transport:
+                self._ucast_transport.sendto(
+                    serialize_sd_message(find_message),
+                    (self.sd_address, self.sd_port),
+                )
 
-            tx_queue = self._tx_queues.get(writer_id)
-            if tx_queue:
-                tx_queue.put_nowait(self.prepare_message(response))
+            await asyncio.sleep(interval_s)
+
+            for found_service in self._found_services:
+                if self._find_request_matches(message, found_service):
+                    self._send_find_service_success(writer_id, found_service)
+                    return
+
+        # All probe attempts exhausted -- the service could not be resolved.
+        self._send_find_service_failure(writer_id, message)
 
     def _handle_send_event_request(self, message: SendEventRequest, writer_id: int):
         for sub in self._service_subscribers.values():

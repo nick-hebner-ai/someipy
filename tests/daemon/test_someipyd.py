@@ -15,6 +15,7 @@ from someipy._internal._daemon.daemon_server import ClientConnectedEventArgs
 from someipy._internal._daemon.daemon_server_client import DaemonServerClient
 from someipy._internal._daemon.subscription import Subscription
 from someipy._internal._daemon.uds_messages import (
+    FindServiceRequest,
     InboundCallMethodResponse,
     OfferServiceRequest,
     SendEventRequest,
@@ -439,12 +440,100 @@ def test_check_services_ttl_task_removes_expired_offered_services(
     assert len(daemon._found_services) == 0
 
 
-def test_find_service_request_sends_negative_response(daemon: SomeipDaemon):
-    pass
+def _decode_find_response(framed: bytes) -> dict:
+    # prepare_message frames a message as a 4-byte little-endian payload length,
+    # padding out to a 256-byte header, then the JSON payload.
+    length = struct.unpack("<I", framed[:4])[0]
+    return json.loads(framed[256 : 256 + length].decode("utf-8"))
 
 
-def test_find_service_request_sends_positive_response(daemon: SomeipDaemon):
-    pass
+def _find_request_for(service_instance) -> FindServiceRequest:
+    return create_uds_message(
+        FindServiceRequest,
+        service_id=service_instance.service_id,
+        instance_id=service_instance.instance_id,
+        major_version=service_instance.major_version,
+        minor_version=service_instance.minor_version,
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_service_request_sends_positive_response(
+    daemon: SomeipDaemon, service_instance: ServiceInstance
+):
+    # Cache hit: respond immediately, no active probe.
+    daemon._found_services.append(service_instance)
+    daemon._tx_queues[1] = asyncio.Queue()
+
+    await daemon._handle_find_service_request(_find_request_for(service_instance), 1)
+
+    assert daemon._tx_queues[1].qsize() == 1
+    resp = _decode_find_response(daemon._tx_queues[1].get_nowait())
+    assert resp["type"] == "FindServiceResponse"
+    assert resp["success"] is True
+    assert resp["service_id"] == service_instance.service_id
+    assert resp["endpoint_ip"] == str(service_instance.endpoint.ip)
+    assert len(daemon._background_tasks) == 0
+    daemon._ucast_transport.sendto.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_find_service_request_dispatches_probe_when_not_cached(
+    daemon: SomeipDaemon, service_instance: ServiceInstance
+):
+    # Cache miss: the handler must NOT block or answer synchronously. It
+    # dispatches a background probe and returns immediately (so the probe's
+    # sleeps never stall the event loop).
+    daemon._tx_queues[1] = asyncio.Queue()
+
+    await daemon._handle_find_service_request(_find_request_for(service_instance), 1)
+
+    assert daemon._tx_queues[1].qsize() == 0  # no immediate response
+    assert len(daemon._background_tasks) == 1
+
+    for task in list(daemon._background_tasks):
+        task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_probe_find_service_sends_find_and_negative_when_unresolved(
+    daemon: SomeipDaemon, service_instance: ServiceInstance
+):
+    daemon._tx_queues[1] = asyncio.Queue()
+
+    await daemon._probe_find_service(
+        _find_request_for(service_instance), 1, attempts=2, interval_s=0
+    )
+
+    # An SD FindService is actively sent to the SD address, once per attempt.
+    assert daemon._ucast_transport.sendto.call_count == 2
+    sent_args = daemon._ucast_transport.sendto.call_args.args
+    assert sent_args[1] == (daemon.sd_address, daemon.sd_port)
+
+    # Unresolved after all attempts -> a negative response is delivered.
+    assert daemon._tx_queues[1].qsize() == 1
+    resp = _decode_find_response(daemon._tx_queues[1].get_nowait())
+    assert resp["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_probe_find_service_reports_positive_when_service_resolves(
+    daemon: SomeipDaemon, service_instance: ServiceInstance
+):
+    # The service is resolvable from the cache (as if a remote answered the
+    # FindService): the probe reports success.
+    daemon._tx_queues[1] = asyncio.Queue()
+    daemon._found_services.append(service_instance)
+
+    await daemon._probe_find_service(
+        _find_request_for(service_instance), 1, attempts=4, interval_s=0
+    )
+
+    assert daemon._ucast_transport.sendto.called  # a FindService was sent
+    assert daemon._tx_queues[1].qsize() == 1
+    resp = _decode_find_response(daemon._tx_queues[1].get_nowait())
+    assert resp["success"] is True
+    assert resp["service_id"] == service_instance.service_id
 
 
 def test_stop_subscribe_eventgroup_request_removes_requested_subscriptions(
