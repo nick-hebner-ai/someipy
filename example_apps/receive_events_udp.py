@@ -43,6 +43,15 @@ def temperature_callback(event_id: int, event_payload: bytes) -> None:
         print(f"Error in deserialization: {e}")
 
 
+def subscription_state_callback(eventgroup_id: int, state: str) -> None:
+    """Called when the offering side answers a subscription with Ack or Nack.
+
+    A subscribe request is fire-and-forget on the wire, so this is the only way
+    to tell an accepted subscription from one nobody answered.
+    """
+    print(f"Subscription to eventgroup 0x{eventgroup_id:04x} is {state}")
+
+
 async def main():
     asyncio.get_running_loop().set_debug(True)
     # It's possible to configure the logging level of the someipy library, e.g. logging.INFO, logging.DEBUG, logging.WARN, ..
@@ -89,6 +98,14 @@ async def main():
     # subscribed event group is received. The callback function will get the bytes of the payload passed which
     # can be deserialized in the callback function
     service_instance_temperature.register_callback(temperature_callback)
+
+    # Optionally register a callback for the subscription outcome. It is invoked
+    # with (eventgroup_id, "acknowledged") when the offering side answers with a
+    # SubscribeEventgroupAck, or "rejected" for a Nack. The current outcome is
+    # also available via service_instance_temperature.subscription_state(id).
+    service_instance_temperature.register_subscription_state_callback(
+        subscription_state_callback
+    )
 
     # The second argument is the time to live (TTL) of the subscription in seconds
     service_instance_temperature.subscribe_eventgroup(temperature_eventgroup, 5)
