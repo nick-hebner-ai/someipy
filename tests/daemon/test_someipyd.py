@@ -1121,3 +1121,116 @@ async def test_ack_without_a_requesting_client_is_ignored(daemon: SomeipDaemon):
     )
 
     assert tx_queue.qsize() == 0
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral client reception port (client_endpoint_port = 0)
+# ---------------------------------------------------------------------------
+
+
+def _subscribe_request_with_port(eventgroup, port: int):
+    return SubscribeEventGroupRequest(
+        service_id=1,
+        instance_id=2,
+        major_version=3,
+        ttl_subscription=10,
+        eventgroup=eventgroup.to_json(),
+        client_endpoint_ip="192.168.1.1",
+        client_endpoint_port=port,
+        udp=True,
+        tcp=False,
+    )
+
+
+def _fake_udp_endpoint(ip: str, port: int):
+    """Stand-in for a bound UDP endpoint reporting the port the OS gave it."""
+    endpoint = Mock()
+    endpoint.src_ip = Mock(return_value=ip)
+    endpoint.src_port = Mock(return_value=port)
+    endpoint.protocol = Mock(return_value=TransportLayerProtocol.UDP)
+    return endpoint
+
+
+@pytest.mark.asyncio
+async def test_port_zero_subscription_advertises_the_bound_port(
+    daemon: SomeipDaemon, eventgroup
+):
+    # The factory binds port 0 and reports back whatever the OS chose.
+    daemon._endpoint_factory.create_server_endpoint = AsyncMock(
+        return_value=_fake_udp_endpoint("192.168.1.1", 54321)
+    )
+
+    await daemon._handle_subscribe_eventgroup_request(
+        _subscribe_request_with_port(eventgroup, 0), 1
+    )
+
+    subscription = daemon._requested_subscriptions.subscriptions[0]
+    # Advertising 0 would tell the offering side to send events nowhere.
+    assert subscription.client_endpoint.port == 54321
+
+
+@pytest.mark.asyncio
+async def test_named_port_is_used_as_given(daemon: SomeipDaemon, eventgroup):
+    daemon._endpoint_factory.create_server_endpoint = AsyncMock(
+        return_value=_fake_udp_endpoint("192.168.1.1", 3002)
+    )
+
+    await daemon._handle_subscribe_eventgroup_request(
+        _subscribe_request_with_port(eventgroup, 3002), 1
+    )
+
+    subscription = daemon._requested_subscriptions.subscriptions[0]
+    assert subscription.client_endpoint.port == 3002
+
+
+@pytest.mark.asyncio
+async def test_second_port_zero_subscription_reuses_one_endpoint(
+    daemon: SomeipDaemon, eventgroup
+):
+    # A client asking for "any free port" wants one reception port for all of its
+    # subscriptions, not a fresh socket per subscription.
+    endpoint = _fake_udp_endpoint("192.168.1.1", 54321)
+    daemon._endpoint_factory.create_server_endpoint = AsyncMock(return_value=endpoint)
+    daemon._someip_client_endpoints.get_endpoints = Mock(return_value=[endpoint])
+
+    await daemon._handle_subscribe_eventgroup_request(
+        _subscribe_request_with_port(eventgroup, 0), 1
+    )
+    await daemon._handle_subscribe_eventgroup_request(
+        _subscribe_request_with_port(eventgroup, 0), 1
+    )
+
+    assert daemon._endpoint_factory.create_server_endpoint.await_count == 0
+    for subscription in daemon._requested_subscriptions.subscriptions:
+        assert subscription.client_endpoint.port == 54321
+
+
+@pytest.mark.asyncio
+async def test_port_zero_unsubscribe_matches_the_subscription(
+    daemon: SomeipDaemon, eventgroup
+):
+    # client_endpoint is part of Subscription equality, so an unsubscribe that
+    # rebuilt the key from the requested 0 would never remove anything.
+    endpoint = _fake_udp_endpoint("192.168.1.1", 54321)
+    daemon._endpoint_factory.create_server_endpoint = AsyncMock(return_value=endpoint)
+
+    await daemon._handle_subscribe_eventgroup_request(
+        _subscribe_request_with_port(eventgroup, 0), 1
+    )
+    assert len(daemon._requested_subscriptions) == 1
+
+    daemon._someip_client_endpoints.get_endpoints = Mock(return_value=[endpoint])
+    daemon._handle_stop_subscribe_eventgroup_request(
+        StopSubscribeEventGroupRequest(
+            service_id=1,
+            instance_id=2,
+            major_version=3,
+            eventgroup=eventgroup.to_json(),
+            client_endpoint_ip="192.168.1.1",
+            client_endpoint_port=0,
+            udp=True,
+            tcp=False,
+        ),
+        1,
+    )
+    assert len(daemon._requested_subscriptions) == 0

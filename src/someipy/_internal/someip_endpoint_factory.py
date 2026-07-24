@@ -46,8 +46,14 @@ class SomeipEndpointFactory:
             loop = asyncio.get_running_loop()
             rcv_socket = create_udp_socket(str(endpoint.ip), endpoint.port)
 
+            # Port 0 asks the OS for any free port. Read back what it actually
+            # bound so the endpoint reports a usable port: callers advertise this
+            # value in SOME/IP-SD endpoint options, and advertising 0 would tell
+            # the offering side to send events nowhere.
+            bound_port = rcv_socket.getsockname()[1]
+
             _, udp_endpoint = await loop.create_datagram_endpoint(
-                lambda: UDPSomeipEndpoint(str(endpoint.ip), endpoint.port),
+                lambda: UDPSomeipEndpoint(str(endpoint.ip), bound_port),
                 sock=rcv_socket,
             )
 
