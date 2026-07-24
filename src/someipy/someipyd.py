@@ -574,33 +574,69 @@ class SomeipDaemon:
                 f"Received unknown message type: {message_type}. Message: {message}"
             )
 
+    def _find_client_reception_endpoint(
+        self, client_id: int, client_ip: str, requested_port: int, protocol
+    ):
+        """Return an existing reception endpoint to use for a subscription.
+
+        A client that asks for port 0 wants "any free port", not a fresh socket
+        per subscription: all of its subscriptions should be answered on one
+        port, so an already-open ephemeral endpoint for the same client, IP and
+        protocol is reused. A client that names a port is matched on that port.
+        """
+        if requested_port == 0:
+            for endpoint in self._someip_client_endpoints.get_endpoints(client_id) or []:
+                if endpoint.src_ip() == client_ip and endpoint.protocol() == protocol:
+                    return endpoint
+            return None
+        return self._someip_client_endpoints.get_endpoint_by_ip_port(
+            client_ip, requested_port, protocol
+        )
+
     async def _handle_subscribe_eventgroup_request(
         self, message: SubscribeEventGroupRequest, client_id: int
     ):
 
         protocols = []
+        requested_port = message["client_endpoint_port"]
+        # The port actually used for event reception. It differs from the
+        # requested one when the client asked for port 0 ("any free port"), in
+        # which case the OS chooses and we must advertise its choice.
+        reception_port = requested_port
+
         if message["udp"]:
             protocols.append(TransportLayerProtocol.UDP)
 
-            if not self._someip_client_endpoints.has_endpoint(
+            existing = self._find_client_reception_endpoint(
+                client_id,
                 message["client_endpoint_ip"],
-                message["client_endpoint_port"],
+                requested_port,
                 TransportLayerProtocol.UDP,
-            ):
+            )
+
+            if existing is None:
                 self.logger.debug(
-                    f"Creating new UDP endpoint for {message['client_endpoint_ip']}:{message['client_endpoint_port']}"
+                    f"Creating new UDP endpoint for {message['client_endpoint_ip']}:{requested_port}"
                 )
 
                 udp_endpoint = await self._endpoint_factory.create_server_endpoint(
                     Endpoint(
                         ip=ipaddress.IPv4Address(message["client_endpoint_ip"]),
-                        port=message["client_endpoint_port"],
+                        port=requested_port,
                     ),
                     TransportLayerProtocol.UDP,
                     self._someip_message_callback,
                 )
 
                 self._someip_client_endpoints.add_endpoint(client_id, udp_endpoint)
+                existing = udp_endpoint
+
+            reception_port = existing.src_port()
+            if reception_port != requested_port:
+                self.logger.debug(
+                    f"Client {client_id} requested port {requested_port}; "
+                    f"receiving events on {message['client_endpoint_ip']}:{reception_port}"
+                )
 
         if message["tcp"]:
             protocols.append(TransportLayerProtocol.TCP)
@@ -608,9 +644,10 @@ class SomeipDaemon:
         event_group = EventGroup.from_json(message["eventgroup"])
 
         client_address = ipaddress.IPv4Address(message["client_endpoint_ip"])
-        client_endpoint = Endpoint(
-            ip=client_address, port=message["client_endpoint_port"]
-        )
+        # reception_port, not the requested one: this endpoint is serialized into
+        # the SubscribeEventgroup's endpoint option and tells the offering side
+        # where to send events.
+        client_endpoint = Endpoint(ip=client_address, port=reception_port)
 
         new_subscription = Subscription(
             service_id=message["service_id"],
@@ -634,9 +671,27 @@ class SomeipDaemon:
     def _handle_stop_subscribe_eventgroup_request(
         self, message: StopSubscribeEventGroupRequest, client_id: int
     ):
+        # Resolve the port the same way the subscribe did: a subscription made
+        # with port 0 is stored under the port the OS actually bound, so building
+        # the lookup key from the requested 0 would fail to match it and the
+        # subscription would never be removed.
+        requested_port = message["client_endpoint_port"]
+        reception_port = requested_port
+        if requested_port == 0:
+            for protocol in (
+                TransportLayerProtocol.UDP,
+                TransportLayerProtocol.TCP,
+            ):
+                endpoint = self._find_client_reception_endpoint(
+                    client_id, message["client_endpoint_ip"], 0, protocol
+                )
+                if endpoint is not None:
+                    reception_port = endpoint.src_port()
+                    break
+
         client_endpoint = Endpoint(
             ip=ipaddress.IPv4Address(message["client_endpoint_ip"]),
-            port=message["client_endpoint_port"],
+            port=reception_port,
         )
 
         event_group = EventGroup.from_json(message["eventgroup"])
