@@ -103,6 +103,11 @@ class ClientServiceInstance(ClientInstanceInterface):
         self._eventgroups_to_subscribe = set()
         self._event_callback: Callable[[int, bytes], None] = None
 
+        # Per-eventgroup subscription outcome reported by the peer via
+        # SubscribeEventgroupAck / Nack, forwarded by the daemon.
+        self._subscription_states: Dict[int, str] = {}
+        self._subscription_state_callback: Callable[[int, str], None] = None
+
         self._method_call_futures: Dict[MethodCall, asyncio.Future] = {}
 
         self._session_id: int = 0  # Starts from 1 to 0xFFFF
@@ -123,6 +128,39 @@ class ClientServiceInstance(ClientInstanceInterface):
     def endpoint(self) -> Tuple[str, int]:
         """Return the (IP, port) endpoint for this client instance."""
         return (self._endpoint_ip, self._endpoint_port)
+
+    def subscription_state(self, eventgroup_id: int) -> str:
+        """Return the peer's answer to the subscription for one eventgroup.
+
+        One of "acknowledged" (SubscribeEventgroupAck received), "rejected"
+        (Nack received) or "unknown" if the peer has not answered yet. A
+        subscribe request is fire-and-forget, so "unknown" means the request was
+        sent but no SD answer has arrived.
+        """
+        return self._subscription_states.get(eventgroup_id, "unknown")
+
+    @property
+    def subscription_states(self) -> Dict[int, str]:
+        """Return a copy of the per-eventgroup subscription states."""
+        return dict(self._subscription_states)
+
+    def register_subscription_state_callback(
+        self, callback: Callable[[int, str], None]
+    ) -> None:
+        """Register a callback invoked with (eventgroup_id, state) on Ack/Nack."""
+        self._subscription_state_callback = callback
+
+    def _subscription_state_received(self, message) -> None:
+        """Record a SubscriptionStateChanged pushed by the daemon."""
+        eventgroup_id = message["event_group_id"]
+        state = message["state"]
+        self._subscription_states[eventgroup_id] = state
+        get_logger(_logger_name).debug(
+            f"Subscription to eventgroup 0x{eventgroup_id:04X} of service "
+            f"0x{self._service.id:04X} is {state}"
+        )
+        if self._subscription_state_callback is not None:
+            self._subscription_state_callback(eventgroup_id, state)
 
     def register_callback(self, callback: Callable[[int, bytes], None]) -> None:
         """Register a callback for received SOME/IP events.

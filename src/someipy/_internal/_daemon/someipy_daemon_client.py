@@ -37,6 +37,7 @@ from someipy._internal._daemon.uds_messages import (
     OfferServiceRequest,
     OutboundCallMethodResponse,
     ReceivedEvent,
+    SubscriptionStateChanged,
     StopOfferServiceRequest,
     create_uds_message,
 )
@@ -322,6 +323,18 @@ class SomeIpDaemonClient:
             get_logger(_logger_name).debug(f"Received ReceivedEvent: {message}")
             for service_instance in self._client_service_instances:
                 service_instance._event_data_received(cast(ReceivedEvent, message))
+
+        elif message["type"] == SubscriptionStateChanged.__name__:
+            get_logger(_logger_name).debug(
+                f"Received SubscriptionStateChanged: {message}"
+            )
+            message = cast(SubscriptionStateChanged, message)
+            for service_instance in self._client_service_instances:
+                if (
+                    service_instance.service.id == message["service_id"]
+                    and service_instance.instance_id == message["instance_id"]
+                ):
+                    service_instance._subscription_state_received(message)
 
         else:
             self._rx_message_queue.put_nowait(message)

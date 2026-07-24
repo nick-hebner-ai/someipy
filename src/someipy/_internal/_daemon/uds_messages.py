@@ -184,6 +184,29 @@ class InboundSubscription(BaseMessage):
     is_renewal: bool
 
 
+class SubscriptionStateChanged(BaseMessage):
+    """Sent from the daemon to a subscribing client when the peer answers its
+    SubscribeEventgroup.
+
+    SOME/IP-SD acknowledges subscriptions with SubscribeEventgroupAck and
+    rejects them with SubscribeEventgroupNack. The daemon already tracks both to
+    manage its own subscription state; this message forwards the outcome so the
+    subscribing application can distinguish "subscribe sent" from "subscription
+    acknowledged by the peer" or "rejected".
+
+    state is one of SUBSCRIPTION_STATE_ACKNOWLEDGED / SUBSCRIPTION_STATE_REJECTED.
+    """
+
+    service_id: int
+    instance_id: int
+    event_group_id: int
+    state: str
+
+
+SUBSCRIPTION_STATE_ACKNOWLEDGED = "acknowledged"
+SUBSCRIPTION_STATE_REJECTED = "rejected"
+
+
 T = TypeVar("T", bound=BaseMessage)
 
 
