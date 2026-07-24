@@ -10,6 +10,7 @@ from call_method_tcp import TestCallMethodTcp
 from offer_method_udp import TestOfferMethodUdp
 from offer_method_tcp import TestOfferMethodTcp
 from offer_multiple_services import TestOfferMultipleServices
+from subscription_state_udp import TestSubscriptionStateUdp
 
 
 vsomeip_library_path = "/home/christian/projects/someip/vsomeip_install/lib/"
@@ -32,6 +33,7 @@ tests = {
     "offer_method_udp": TestOfferMethodUdp,
     "offer_method_tcp": TestOfferMethodTcp,
     "offer_multiple_services": TestOfferMultipleServices,
+    "subscription_state_udp": TestSubscriptionStateUdp,
 }
 
 test_summary = {}

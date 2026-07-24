@@ -91,6 +91,9 @@ from someipy._internal._daemon.uds_messages import (
     InboundCallMethodRequest,
     InboundCallMethodResponse,
     InboundSubscription,
+    SUBSCRIPTION_STATE_ACKNOWLEDGED,
+    SUBSCRIPTION_STATE_REJECTED,
+    SubscriptionStateChanged,
     FindServiceRequest,
     FindServiceResponse,
     OfferServiceRequest,
@@ -1645,6 +1648,36 @@ class SomeipDaemon:
                         ),
                     )
 
+    def _notify_subscription_state(
+        self, event_group_entry: SdEventGroupEntry, state: str
+    ) -> None:
+        """Forward a SubscribeEventgroupAck/Nack outcome to the requesting client.
+
+        The requesting client is found via _requested_subscriptions, which maps
+        each requested subscription to the UDS writer that asked for it, so the
+        notification only goes to clients that actually subscribed.
+        """
+        sd_entry = event_group_entry.sd_entry
+        matches = self._requested_subscriptions.has_subscriptions(
+            sd_entry.service_id,
+            sd_entry.instance_id,
+            sd_entry.major_version,
+        )
+        for subscription, writer_id in matches:
+            if subscription.eventgroup.id != event_group_entry.eventgroup_id:
+                continue
+            tx_queue = self._tx_queues.get(writer_id)
+            if tx_queue is None:
+                continue
+            message = create_uds_message(
+                SubscriptionStateChanged,
+                service_id=sd_entry.service_id,
+                instance_id=sd_entry.instance_id,
+                event_group_id=event_group_entry.eventgroup_id,
+                state=state,
+            )
+            tx_queue.put_nowait(self.prepare_message(message))
+
     def _handle_sd_subscribe_ack_eventgroup_entry(
         self, event_group_entry: SdEventGroupEntry
     ):
@@ -1694,12 +1727,17 @@ class SomeipDaemon:
             self.logger.info(f"Subscription acknowledged: {pending_subscription}")
             self._pending_subscriptions.discard(pending_subscription)
 
+        self._notify_subscription_state(
+            event_group_entry, SUBSCRIPTION_STATE_ACKNOWLEDGED
+        )
+
     def _handle_sd_subscribe_nack_eventgroup_entry(
         self, event_group_entry: SdEventGroupEntry
     ):
         self.logger.info(
             f"Received subscribe nack eventgroup entry: {event_group_entry}"
         )
+        self._notify_subscription_state(event_group_entry, SUBSCRIPTION_STATE_REJECTED)
 
     def datagram_received_mcast(
         self, data: bytes, addr: Tuple[Union[str, Any], int]

@@ -1004,3 +1004,120 @@ async def test_start_sd_listening_selects_socket_by_multicast_range(
     else:
         bcast.assert_called_once()
         mcast.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Subscription state notifications (SubscribeEventgroupAck / Nack)
+# ---------------------------------------------------------------------------
+
+
+def _eventgroup_entry(
+    service_id: int, instance_id: int, eventgroup_id: int, major_version: int = 3
+):
+    """Minimal stand-in for a received SD subscribe-ack/nack eventgroup entry.
+
+    major_version must match the requested subscription: the daemon keys the
+    lookup on (service, instance, major_version), so an ack for a different
+    major version belongs to a different service and must not be forwarded.
+    """
+    sd_entry = Mock()
+    sd_entry.service_id = service_id
+    sd_entry.instance_id = instance_id
+    sd_entry.major_version = major_version
+    entry = Mock()
+    entry.sd_entry = sd_entry
+    entry.eventgroup_id = eventgroup_id
+    return entry
+
+
+@pytest.mark.asyncio
+async def test_subscribe_ack_notifies_requesting_client(
+    daemon: SomeipDaemon,
+    subscribe_event_group_request_udp: SubscribeEventGroupRequest,
+):
+    # A client asks to subscribe, so the daemon knows which writer to notify.
+    await daemon._handle_subscribe_eventgroup_request(
+        subscribe_event_group_request_udp, 1
+    )
+    subscription = daemon._requested_subscriptions.subscriptions[0]
+    tx_queue = asyncio.Queue()
+    daemon._tx_queues[1] = tx_queue
+
+    daemon._handle_sd_subscribe_ack_eventgroup_entry(
+        _eventgroup_entry(
+            subscription.service_id,
+            subscription.instance_id,
+            subscription.eventgroup.id,
+            subscription.major_version,
+        )
+    )
+
+    assert tx_queue.qsize() == 1
+    message = _decode_client_message(tx_queue.get_nowait())
+    assert message["type"] == "SubscriptionStateChanged"
+    assert message["state"] == "acknowledged"
+    assert message["service_id"] == subscription.service_id
+    assert message["event_group_id"] == subscription.eventgroup.id
+
+
+@pytest.mark.asyncio
+async def test_subscribe_nack_reports_rejected(
+    daemon: SomeipDaemon,
+    subscribe_event_group_request_udp: SubscribeEventGroupRequest,
+):
+    await daemon._handle_subscribe_eventgroup_request(
+        subscribe_event_group_request_udp, 1
+    )
+    subscription = daemon._requested_subscriptions.subscriptions[0]
+    tx_queue = asyncio.Queue()
+    daemon._tx_queues[1] = tx_queue
+
+    daemon._handle_sd_subscribe_nack_eventgroup_entry(
+        _eventgroup_entry(
+            subscription.service_id,
+            subscription.instance_id,
+            subscription.eventgroup.id,
+            subscription.major_version,
+        )
+    )
+
+    assert tx_queue.qsize() == 1
+    message = _decode_client_message(tx_queue.get_nowait())
+    assert message["state"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_ack_for_other_eventgroup_is_not_forwarded(
+    daemon: SomeipDaemon,
+    subscribe_event_group_request_udp: SubscribeEventGroupRequest,
+):
+    await daemon._handle_subscribe_eventgroup_request(
+        subscribe_event_group_request_udp, 1
+    )
+    subscription = daemon._requested_subscriptions.subscriptions[0]
+    tx_queue = asyncio.Queue()
+    daemon._tx_queues[1] = tx_queue
+
+    daemon._handle_sd_subscribe_ack_eventgroup_entry(
+        _eventgroup_entry(
+            subscription.service_id,
+            subscription.instance_id,
+            subscription.eventgroup.id + 1,  # a different eventgroup
+            subscription.major_version,
+        )
+    )
+
+    assert tx_queue.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_ack_without_a_requesting_client_is_ignored(daemon: SomeipDaemon):
+    tx_queue = asyncio.Queue()
+    daemon._tx_queues[1] = tx_queue
+
+    # Nobody subscribed, so an ack for this service must not be forwarded.
+    daemon._handle_sd_subscribe_ack_eventgroup_entry(
+        _eventgroup_entry(0x1234, 1, 1)
+    )
+
+    assert tx_queue.qsize() == 0
