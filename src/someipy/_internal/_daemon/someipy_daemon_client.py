@@ -310,13 +310,20 @@ class SomeIpDaemonClient:
             message = cast(OutboundCallMethodResponse, message)
 
             for service_instance in self._client_service_instances:
-                if (
-                    service_instance.service.id == message["service_id"]
-                    and message["method_id"]
-                    in [m for m in service_instance.service.methods.keys()]
-                    and service_instance.endpoint[1] == message["dst_endpoint_port"]
-                    and service_instance.endpoint[0] == message["dst_endpoint_ip"]
-                ):
+                # Dropped the endpoint-tuple match (service_instance.endpoint
+                # vs. message["dst_endpoint_*"]): service_instance.endpoint is
+                # the caller's raw declared endpoint_port (0 for consumed
+                # services, per tcu_sim's own test_someip_client.py:328) and
+                # is never updated with the real OS-assigned port, while the
+                # daemon reports the real bound port here -- so this
+                # comparison could never match and silently dropped every
+                # response before it reached _method_call_data_received.
+                # That method already does its own robust correlation via
+                # method_call_key/self._method_call_futures, so it's safe to
+                # let it own correctness instead of gating on this field.
+                if service_instance.service.id == message["service_id"] and message[
+                    "method_id"
+                ] in [m for m in service_instance.service.methods.keys()]:
                     service_instance._method_call_data_received(message)
 
         elif message["type"] == ReceivedEvent.__name__:
