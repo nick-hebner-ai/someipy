@@ -1121,7 +1121,13 @@ class SomeipDaemon:
             client_id=message["client_id"],
             session_id=message["session_id"],
             src_ip=message["src_endpoint_ip"],
-            src_port=message["src_endpoint_port"],
+            # Use the endpoint's real bound port, not the client's raw
+            # declared endpoint_port (0 when a client wants the OS to pick
+            # a free port) -- the response-side correlation key in
+            # _someip_message_callback is built from the endpoint's real
+            # OS-assigned port, so using the raw value here means the two
+            # keys can never match.
+            src_port=endpoint.src_port(),
         )
 
         if new_call in self._issued_method_calls:
