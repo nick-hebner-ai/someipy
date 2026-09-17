@@ -440,6 +440,39 @@ def test_check_services_ttl_task_removes_expired_offered_services(
     assert len(daemon._found_services) == 0
 
 
+def test_check_services_ttl_task_removes_expired_active_subscription(
+    daemon: SomeipDaemon, eventgroup: EventGroup
+):
+    # Regression test: the sweep also prunes expired *active subscriptions*,
+    # and its removal branch logs the subscription's eventgroup. Reaching
+    # that branch used to raise AttributeError, which killed the whole TTL
+    # task -- the `while True` loop in _check_services_ttl_task lives inside
+    # its own try/except, so one exception stopped the sweep permanently and
+    # _found_services was never pruned again for the daemon's lifetime.
+    endpoint = Endpoint(ipaddress.IPv4Address("127.0.0.1"), 3333)
+    subscription = Subscription(
+        service_id=0x1234,
+        instance_id=1,
+        major_version=1,
+        eventgroup=eventgroup,
+        ttl_seconds=10,
+        client_endpoint=endpoint,
+        server_endpoint=endpoint,
+        protocols=frozenset([TransportLayerProtocol.UDP]),
+        timestamp_last_update=time.time(),
+    )
+    daemon._active_subscriptions.add(subscription)
+
+    daemon._check_service_ttl_task_impl()
+    assert len(daemon._active_subscriptions) == 1
+
+    # Expire it, then sweep again.
+    subscription.timestamp_last_update -= subscription.ttl_seconds + 1
+    daemon._check_service_ttl_task_impl()
+
+    assert len(daemon._active_subscriptions) == 0
+
+
 def _decode_find_response(framed: bytes) -> dict:
     # prepare_message frames a message as a 4-byte little-endian payload length,
     # padding out to a 256-byte header, then the JSON payload.

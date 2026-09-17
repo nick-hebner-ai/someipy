@@ -465,7 +465,7 @@ class SomeipDaemon:
             self._active_subscriptions.remove(subscription)
             self.logger.debug(
                 f"Removed active subscription for service {subscription.service_id}, "
-                f"instance {subscription.instance_id}, eventgroup {subscription.eventgroup_id}"
+                f"instance {subscription.instance_id}, eventgroup {subscription.eventgroup.id}"
             )
 
     def _cleanup_obsolete_pending_subscriptions(self):
