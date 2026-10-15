@@ -26,7 +26,7 @@ import struct
 import sys
 import ipaddress
 import time
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import someipy
 from someipy._internal._common.endpoint import Endpoint
@@ -58,6 +58,7 @@ from someipy._internal._sd.sd_message_creator import (
 from someipy._internal._sd.service_instance import ServiceInstance
 from someipy._internal.message_types import MessageType
 from someipy._internal.someip_endpoint import (
+    SomeipEndpoint,
     TCPClientSomeipEndpoint,
     TCPSomeipEndpoint,
 )
@@ -251,12 +252,11 @@ class SomeipDaemon:
 
         client_endpoints = self._someip_server_endpoints.get_endpoints(client_id)
         if client_endpoints is not None:
-            for endpoint in client_endpoints:
+            for endpoint in list(client_endpoints):
                 self.logger.debug(
                     f"Closing endpoint {endpoint.dst_ip()}:{endpoint.dst_port()} for client {client_id}"
                 )
-                endpoint.shutdown()
-                self._someip_server_endpoints.remove_endpoint(client_id, endpoint)
+                self._release_endpoint(self._someip_server_endpoints, client_id, endpoint)
 
         self.logger.debug(f"Client disconnected")
 
@@ -574,6 +574,41 @@ class SomeipDaemon:
                 f"Received unknown message type: {message_type}. Message: {message}"
             )
 
+    def _udp_endpoint_at(self, ip: str, port: int) -> Optional[SomeipEndpoint]:
+        """The open UDP endpoint bound to ip:port, whichever role opened it.
+
+        A SOME/IP node serves, subscribes and calls methods through one socket
+        per port, and a second bind to the same address fails.
+        """
+        for storage in (self._someip_server_endpoints, self._someip_client_endpoints):
+            endpoint = storage.get_endpoint_by_ip_port(
+                ip, port, TransportLayerProtocol.UDP
+            )
+            if endpoint is not None:
+                return endpoint
+        return None
+
+    def _endpoint_in_use(self, endpoint: SomeipEndpoint) -> bool:
+        return any(
+            stored is endpoint
+            for storage in (self._someip_server_endpoints, self._someip_client_endpoints)
+            for stored in storage.get_all_endpoints()
+        )
+
+    def _release_endpoint(
+        self, storage: SomeipEndpointStorage, client_id: int, endpoint: SomeipEndpoint
+    ) -> None:
+        """Drop one owner's reference, closing the socket once nobody uses it."""
+        storage.remove_endpoint(client_id, endpoint)
+        if not self._endpoint_in_use(endpoint):
+            endpoint.shutdown()
+
+    @staticmethod
+    def _holds(
+        storage: SomeipEndpointStorage, client_id: int, endpoint: SomeipEndpoint
+    ) -> bool:
+        return any(stored is endpoint for stored in storage.get_endpoints(client_id) or [])
+
     def _find_client_reception_endpoint(
         self, client_id: int, client_ip: str, requested_port: int, protocol
     ):
@@ -589,6 +624,8 @@ class SomeipDaemon:
                 if endpoint.src_ip() == client_ip and endpoint.protocol() == protocol:
                     return endpoint
             return None
+        if protocol == TransportLayerProtocol.UDP:
+            return self._udp_endpoint_at(client_ip, requested_port)
         return self._someip_client_endpoints.get_endpoint_by_ip_port(
             client_ip, requested_port, protocol
         )
@@ -628,8 +665,10 @@ class SomeipDaemon:
                     self._someip_message_callback,
                 )
 
-                self._someip_client_endpoints.add_endpoint(client_id, udp_endpoint)
                 existing = udp_endpoint
+
+            if not self._holds(self._someip_client_endpoints, client_id, existing):
+                self._someip_client_endpoints.add_endpoint(client_id, existing)
 
             reception_port = existing.src_port()
             if reception_port != requested_port:
@@ -836,15 +875,18 @@ class SomeipDaemon:
                 service_to_add.endpoint.port,
                 TransportLayerProtocol.UDP,
             ):
-                self.logger.debug(
-                    f"Creating new UDP endpoint for {service_to_add.endpoint}"
+                udp_endpoint = self._udp_endpoint_at(
+                    str(service_to_add.endpoint.ip), service_to_add.endpoint.port
                 )
-
-                udp_endpoint = await self._endpoint_factory.create_server_endpoint(
-                    service_to_add.endpoint,
-                    TransportLayerProtocol.UDP,
-                    self._someip_message_callback,
-                )
+                if udp_endpoint is None:
+                    self.logger.debug(
+                        f"Creating new UDP endpoint for {service_to_add.endpoint}"
+                    )
+                    udp_endpoint = await self._endpoint_factory.create_server_endpoint(
+                        service_to_add.endpoint,
+                        TransportLayerProtocol.UDP,
+                        self._someip_message_callback,
+                    )
 
                 self._someip_server_endpoints.add_endpoint(client_id, udp_endpoint)
 
@@ -926,16 +968,25 @@ class SomeipDaemon:
 
         if service_to_stop.has_udp:
             try:
-                udp_endpoint = self._someip_server_endpoints.get_endpoint(
-                    writer_id, TransportLayerProtocol.UDP
+                udp_endpoint = self._someip_server_endpoints.get_endpoint_by_ip_port(
+                    str(service_to_stop.endpoint.ip),
+                    service_to_stop.endpoint.port,
+                    TransportLayerProtocol.UDP,
                 )
-                if udp_endpoint:
+                still_offered = any(
+                    service.has_udp and service.endpoint == service_to_stop.endpoint
+                    for service in self._services_to_offer.get_all_services()
+                )
+                if (
+                    udp_endpoint
+                    and not still_offered
+                    and self._holds(self._someip_server_endpoints, writer_id, udp_endpoint)
+                ):
                     self.logger.debug(
-                        f"Closing UDP endpoint for {service_to_stop.endpoint}"
+                        f"Releasing UDP endpoint for {service_to_stop.endpoint}"
                     )
-                    udp_endpoint.shutdown()
-                    self._someip_server_endpoints.remove_endpoint(
-                        writer_id, udp_endpoint
+                    self._release_endpoint(
+                        self._someip_server_endpoints, writer_id, udp_endpoint
                     )
             except Exception as e:
                 self.logger.error(
@@ -1015,6 +1066,19 @@ class SomeipDaemon:
     ):
         endpoint = None
         if TransportLayerProtocol(message["protocol"]) == TransportLayerProtocol.UDP:
+            shared = (
+                self._udp_endpoint_at(
+                    message["src_endpoint_ip"], message["src_endpoint_port"]
+                )
+                if message["src_endpoint_port"] != 0
+                else None
+            )
+            if shared is not None and not self._someip_client_endpoints.has_endpoint(
+                message["src_endpoint_ip"],
+                message["src_endpoint_port"],
+                TransportLayerProtocol.UDP,
+            ):
+                self._someip_client_endpoints.add_endpoint(client_id, shared)
             if not self._someip_client_endpoints.has_endpoint(
                 message["src_endpoint_ip"],
                 message["src_endpoint_port"],

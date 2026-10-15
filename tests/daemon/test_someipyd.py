@@ -16,6 +16,7 @@ from someipy._internal._daemon.daemon_server_client import DaemonServerClient
 from someipy._internal._daemon.subscription import Subscription
 from someipy._internal._daemon.uds_messages import (
     FindServiceRequest,
+    OutboundCallMethodRequest,
     InboundCallMethodResponse,
     OfferServiceRequest,
     SendEventRequest,
@@ -1234,3 +1235,186 @@ async def test_port_zero_unsubscribe_matches_the_subscription(
         1,
     )
     assert len(daemon._requested_subscriptions) == 0
+
+
+@pytest.fixture
+def udp_eventgroup() -> EventGroup:
+    return EventGroup(id=4, events=[Event(id=4, protocol=TransportLayerProtocol.UDP)])
+
+
+@pytest.fixture
+def udp_method() -> Method:
+    return Method(id=1, protocol=TransportLayerProtocol.UDP)
+
+
+def _bound_udp_endpoints(mock_endpoint_factory) -> list:
+    """Make the factory return a distinct fake UDP socket per bind, and record them."""
+    bound = []
+
+    async def create(endpoint, protocol, callback):
+        fake = MagicMock()
+        fake.src_ip.return_value = str(endpoint.ip)
+        fake.src_port.return_value = endpoint.port
+        fake.protocol.return_value = protocol
+        bound.append(fake)
+        return fake
+
+    mock_endpoint_factory.create_server_endpoint = AsyncMock(side_effect=create)
+    return bound
+
+
+def _subscribe_on(eventgroup, ip: str, port: int) -> SubscribeEventGroupRequest:
+    return create_uds_message(
+        SubscribeEventGroupRequest,
+        service_id=7,
+        instance_id=1,
+        major_version=1,
+        ttl_subscription=3,
+        eventgroup=eventgroup.to_json(),
+        client_endpoint_ip=ip,
+        client_endpoint_port=port,
+        udp=True,
+        tcp=False,
+    )
+
+
+def _offer_on(eventgroup, method, ip: str, port: int, service_id: int = 1, stop=False):
+    return create_uds_message(
+        StopOfferServiceRequest if stop else OfferServiceRequest,
+        service_id=service_id,
+        instance_id=2,
+        major_version=3,
+        minor_version=0,
+        endpoint_ip=ip,
+        endpoint_port=port,
+        ttl=5,
+        eventgroup_list=[eventgroup.to_json()],
+        method_list=[method.to_json()],
+        cyclic_offer_delay_ms=1000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_subscription_on_an_offered_port_shares_its_socket(
+    daemon, mock_endpoint_factory, udp_eventgroup, udp_method
+):
+    bound = _bound_udp_endpoints(mock_endpoint_factory)
+    await daemon._handle_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30501), 1
+    )
+    await daemon._handle_subscribe_eventgroup_request(
+        _subscribe_on(udp_eventgroup, "192.168.1.10", 30501), 2
+    )
+
+    assert len(bound) == 1
+    (subscription,) = daemon._requested_subscriptions.subscriptions
+    assert subscription.client_endpoint.port == 30501
+
+
+@pytest.mark.asyncio
+async def test_offer_on_a_subscribed_port_shares_its_socket(
+    daemon, mock_endpoint_factory, udp_eventgroup, udp_method
+):
+    bound = _bound_udp_endpoints(mock_endpoint_factory)
+    await daemon._handle_subscribe_eventgroup_request(
+        _subscribe_on(udp_eventgroup, "192.168.1.10", 30501), 2
+    )
+    await daemon._handle_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30501), 1
+    )
+
+    assert len(bound) == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_offer_keeps_a_socket_a_subscription_still_uses(
+    daemon, mock_endpoint_factory, udp_eventgroup, udp_method
+):
+    bound = _bound_udp_endpoints(mock_endpoint_factory)
+    await daemon._handle_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30501), 1
+    )
+    await daemon._handle_subscribe_eventgroup_request(
+        _subscribe_on(udp_eventgroup, "192.168.1.10", 30501), 2
+    )
+
+    daemon._handle_stop_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30501, stop=True), 1
+    )
+
+    bound[0].shutdown.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stop_offer_keeps_a_socket_another_offered_service_uses(
+    daemon, mock_endpoint_factory, udp_eventgroup, udp_method
+):
+    bound = _bound_udp_endpoints(mock_endpoint_factory)
+    await daemon._handle_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30502, service_id=1), 1
+    )
+    await daemon._handle_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30502, service_id=4), 1
+    )
+
+    daemon._handle_stop_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30502, service_id=1, stop=True), 1
+    )
+
+    bound[0].shutdown.assert_not_called()
+    assert daemon._someip_server_endpoints.has_endpoint(
+        "192.168.1.10", 30502, TransportLayerProtocol.UDP
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_offer_closes_the_socket_once_unused(
+    daemon, mock_endpoint_factory, udp_eventgroup, udp_method
+):
+    bound = _bound_udp_endpoints(mock_endpoint_factory)
+    await daemon._handle_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30501), 1
+    )
+
+    daemon._handle_stop_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30501, stop=True), 1
+    )
+
+    bound[0].shutdown.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_method_call_from_an_offered_port_shares_its_socket(
+    daemon, mock_endpoint_factory, udp_eventgroup, udp_method
+):
+    bound = _bound_udp_endpoints(mock_endpoint_factory)
+    mock_endpoint_factory.create_udp_client_endpoint = AsyncMock()
+    await daemon._handle_offer_service_request(
+        _offer_on(udp_eventgroup, udp_method, "192.168.1.10", 30501), 1
+    )
+
+    await daemon._handle_outbound_call_method_request(
+        create_uds_message(
+            OutboundCallMethodRequest,
+            service_id=7,
+            instance_id=1,
+            method_id=1,
+            client_id=1,
+            session_id=1,
+            protocol_version=0x01,
+            major_version=1,
+            minor_version=0,
+            dst_endpoint_ip="192.168.1.20",
+            dst_endpoint_port=30501,
+            src_endpoint_ip="192.168.1.10",
+            src_endpoint_port=30501,
+            protocol=TransportLayerProtocol.UDP.value,
+            payload=base64.b64encode(b"\x01").decode(),
+        ),
+        2,
+    )
+
+    mock_endpoint_factory.create_udp_client_endpoint.assert_not_called()
+    assert len(bound) == 1
+    bound[0].sendto.assert_called_once()
+    assert bound[0].sendto.call_args.args[1] == ("192.168.1.20", 30501)
