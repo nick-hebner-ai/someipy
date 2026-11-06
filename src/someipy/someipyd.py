@@ -25,6 +25,7 @@ import os
 import struct
 import sys
 import ipaddress
+import socket
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -111,6 +112,7 @@ from someipy._internal.utils import (
     DatagramAdapter,
     create_rcv_multicast_socket,
     create_rcv_broadcast_socket,
+    create_tcp_client_socket,
     create_udp_socket,
 )
 from someipy._internal._daemon.offer_service_storage import (
@@ -213,6 +215,13 @@ class SomeipDaemon:
 
         self._issued_method_calls: Dict[MethodCall, int] = {}
 
+        # Local TCP ports bound for port-0 subscriptions before an offer says
+        # where to connect, keyed by (ip, port) and owned by a client id.
+        self._tcp_port_reservations: Dict[
+            Tuple[str, int], Tuple[int, socket.socket]
+        ] = {}
+        self._subscribes_awaiting_connection: Set[Tuple] = set()
+
     async def new_client_connected(
         self, sender: object, event_args: ClientConnectedEventArgs
     ):
@@ -237,6 +246,7 @@ class SomeipDaemon:
 
         # Remove all subscriptions for the client
         self._requested_subscriptions.remove_client(client_id)
+        self._release_tcp_port_reservations(client_id)
 
         # Clean up the transmission task for the client. This will also clean up the transmission queue
         tx_task = self._tx_tasks.pop(client_id, None)
@@ -630,6 +640,59 @@ class SomeipDaemon:
             client_ip, requested_port, protocol
         )
 
+    def _reserved_tcp_port(self, client_id: int, client_ip: str) -> Optional[int]:
+        for (ip, port), (owner, _) in self._tcp_port_reservations.items():
+            if ip == client_ip and owner == client_id:
+                return port
+        return None
+
+    def _tcp_reception_port(self, client_id: int, client_ip: str) -> int:
+        """A concrete local port for a client's port-0 TCP subscriptions.
+
+        The port is bound now, before an offer tells us where to connect,
+        because the subscription is keyed by it and the SubscribeEventgroup
+        must advertise it: the offering side matches the endpoint option
+        against the source of the TCP connection.
+        """
+        existing = self._find_client_reception_endpoint(
+            client_id, client_ip, 0, TransportLayerProtocol.TCP
+        )
+        if existing is not None:
+            return existing.src_port()
+        reserved = self._reserved_tcp_port(client_id, client_ip)
+        if reserved is not None:
+            return reserved
+        sock = create_tcp_client_socket(client_ip, 0)
+        port = sock.getsockname()[1]
+        self._tcp_port_reservations[(client_ip, port)] = (client_id, sock)
+        return port
+
+    def _release_tcp_port_reservations(self, client_id: int) -> None:
+        for key, (owner, sock) in list(self._tcp_port_reservations.items()):
+            if owner == client_id:
+                sock.close()
+                del self._tcp_port_reservations[key]
+
+    def _find_tcp_client_endpoint(
+        self, client_id: int, src_ip: str, src_port: int, dst_ip: str, dst_port: int
+    ) -> Optional[TCPClientSomeipEndpoint]:
+        """The TCP client endpoint from src to dst. Port 0 matches any of the
+        client's own endpoints, since an endpoint reports the port it bound."""
+        if src_port == 0:
+            candidates = self._someip_client_endpoints.get_endpoints(client_id) or []
+        else:
+            candidates = self._someip_client_endpoints.get_all_endpoints()
+        for endpoint in candidates:
+            if (
+                endpoint.protocol() == TransportLayerProtocol.TCP
+                and endpoint.src_ip() == src_ip
+                and (src_port == 0 or endpoint.src_port() == src_port)
+                and endpoint.dst_ip() == dst_ip
+                and endpoint.dst_port() == dst_port
+            ):
+                return endpoint
+        return None
+
     async def _handle_subscribe_eventgroup_request(
         self, message: SubscribeEventGroupRequest, client_id: int
     ):
@@ -679,6 +742,10 @@ class SomeipDaemon:
 
         if message["tcp"]:
             protocols.append(TransportLayerProtocol.TCP)
+            if reception_port == 0:
+                reception_port = self._tcp_reception_port(
+                    client_id, message["client_endpoint_ip"]
+                )
 
         event_group = EventGroup.from_json(message["eventgroup"])
 
@@ -727,6 +794,11 @@ class SomeipDaemon:
                 if endpoint is not None:
                     reception_port = endpoint.src_port()
                     break
+            if reception_port == 0 and message["tcp"]:
+                reception_port = (
+                    self._reserved_tcp_port(client_id, message["client_endpoint_ip"])
+                    or 0
+                )
 
         client_endpoint = Endpoint(
             ip=ipaddress.IPv4Address(message["client_endpoint_ip"]),
@@ -1115,12 +1187,14 @@ class SomeipDaemon:
 
         elif TransportLayerProtocol(message["protocol"]) == TransportLayerProtocol.TCP:
 
-            if not self._someip_client_endpoints.has_tcp_endpoint(
+            endpoint = self._find_tcp_client_endpoint(
+                client_id,
                 message["src_endpoint_ip"],
                 message["src_endpoint_port"],
                 message["dst_endpoint_ip"],
                 message["dst_endpoint_port"],
-            ):
+            )
+            if endpoint is None:
                 self.logger.debug(
                     f"Creating new TCP endpoint for {message['src_endpoint_ip']}:{message['src_endpoint_port']}"
                 )
@@ -1139,17 +1213,7 @@ class SomeipDaemon:
                 )
 
                 self._someip_client_endpoints.add_endpoint(client_id, tcp_endpoint)
-                endpoint: TCPClientSomeipEndpoint = tcp_endpoint
-            else:
-                endpoint: TCPClientSomeipEndpoint = (
-                    self._someip_client_endpoints.get_end_point_by_src_and_dst_ip_port(
-                        message["src_endpoint_ip"],
-                        message["src_endpoint_port"],
-                        message["dst_endpoint_ip"],
-                        message["dst_endpoint_port"],
-                        TransportLayerProtocol.TCP,
-                    )
-                )
+                endpoint = tcp_endpoint
 
             # TODO: This shall not block the handle_client function. A new task shall be created
             # For TCP wait for the connection to be established
@@ -1598,83 +1662,151 @@ class SomeipDaemon:
             )
 
             if TransportLayerProtocol.TCP in requested_protocols:
-                if not self._someip_client_endpoints.has_tcp_endpoint(
-                    str(requested_subscription.client_endpoint.ip),
-                    requested_subscription.client_endpoint.port,
-                    str(offered_service.endpoint.ip),
-                    offered_service.endpoint.port,
-                ):
-                    self.logger.debug(
-                        f"Creating new TCP endpoint for {requested_subscription.client_endpoint}"
+                tcp_endpoint = self._tcp_client_endpoint_for(
+                    client_id, requested_subscription, offered_service
+                )
+                if not tcp_endpoint.is_connected():
+                    self._subscribe_once_connected(
+                        tcp_endpoint,
+                        offered_service,
+                        requested_subscription,
+                        requested_protocols,
                     )
+                    continue
 
-                    tcp_endpoint = self._endpoint_factory.create_tcp_client_endpoint(
-                        offered_service.endpoint,
-                        requested_subscription.client_endpoint,
-                        self._someip_message_callback,
-                        self.logger,
-                    )
+            self._send_subscribe(
+                offered_service, requested_subscription, requested_protocols
+            )
 
-                    self._someip_client_endpoints.add_endpoint(client_id, tcp_endpoint)
+    def _tcp_client_endpoint_for(
+        self,
+        client_id: int,
+        requested_subscription: Subscription,
+        offered_service: ServiceInstance,
+    ) -> TCPClientSomeipEndpoint:
+        client_ip = str(requested_subscription.client_endpoint.ip)
+        client_port = requested_subscription.client_endpoint.port
+        existing = self._find_tcp_client_endpoint(
+            client_id,
+            client_ip,
+            client_port,
+            str(offered_service.endpoint.ip),
+            offered_service.endpoint.port,
+        )
+        if existing is not None:
+            return existing
 
-                    # TODO: This shall not block the handle_client function. A new task shall be created
-                    # For TCP wait for the connection to be established
-                    # while not tcp_endpoint.is_connected():
-                    #    await asyncio.sleep(0.2)
+        self.logger.debug(
+            f"Creating new TCP endpoint for {requested_subscription.client_endpoint}"
+        )
+        reservation = self._tcp_port_reservations.pop((client_ip, client_port), None)
+        tcp_endpoint = self._endpoint_factory.create_tcp_client_endpoint(
+            offered_service.endpoint,
+            requested_subscription.client_endpoint,
+            self._someip_message_callback,
+            self.logger,
+            sock=reservation[1] if reservation else None,
+        )
+        self._someip_client_endpoints.add_endpoint(client_id, tcp_endpoint)
+        return tcp_endpoint
 
-            (
-                session_id,
-                reboot_flag,
-            ) = self._unicast_session_handler.update_session()
+    def _subscribe_once_connected(
+        self,
+        tcp_endpoint: TCPClientSomeipEndpoint,
+        offered_service: ServiceInstance,
+        requested_subscription: Subscription,
+        requested_protocols: Set[TransportLayerProtocol],
+    ) -> None:
+        """Send the SubscribeEventgroup once the TCP connection is up.
 
-            # Build subscribe message
-            sd_message = SdMessage()
-            sd_message.session_id = session_id
-            sd_message.reboot_flag = reboot_flag
+        The offering side rejects a TCP subscription whose endpoint option has
+        no established connection behind it. A wait that outlives the offer's
+        TTL is dropped; the next offer starts a new one.
+        """
+        key = (
+            id(tcp_endpoint),
+            offered_service.service_id,
+            offered_service.instance_id,
+            requested_subscription.eventgroup.id,
+        )
+        if key in self._subscribes_awaiting_connection:
+            return
+        self._subscribes_awaiting_connection.add(key)
 
-            options = []
-            for protocol in requested_protocols:
-                options.append(
-                    IpV4EndpointOption(
-                        address=requested_subscription.client_endpoint.ip,
-                        protocol=protocol,
-                        port=requested_subscription.client_endpoint.port,
-                    )
+        async def send_when_connected():
+            try:
+                await asyncio.wait_for(
+                    tcp_endpoint.wait_connected(), timeout=offered_service.ttl
+                )
+            except asyncio.TimeoutError:
+                return
+            finally:
+                self._subscribes_awaiting_connection.discard(key)
+            if requested_subscription in self._requested_subscriptions.subscriptions:
+                self._send_subscribe(
+                    offered_service, requested_subscription, requested_protocols
                 )
 
-            entry = SubscribeEventGroupEntry(
-                service_id=offered_service.service_id,
-                instance_id=offered_service.instance_id,
-                major_version=offered_service.major_version,
-                ttl=requested_subscription.ttl_seconds,
-                eventgroup_id=requested_subscription.eventgroup.id,
-                counter=0,
-                ip_v4_endpoints=options,
-                ip_v6_endpoints=[],
-            )
-            sd_message.entries.append(entry)
+        task = asyncio.create_task(send_when_connected())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
-            client_endpoint = requested_subscription.client_endpoint
-            server_endpoint = offered_service.endpoint
+    def _send_subscribe(
+        self,
+        offered_service: ServiceInstance,
+        requested_subscription: Subscription,
+        requested_protocols: Set[TransportLayerProtocol],
+    ) -> None:
+        (
+            session_id,
+            reboot_flag,
+        ) = self._unicast_session_handler.update_session()
 
-            pending_subscription = Subscription(
-                service_id=offered_service.service_id,
-                instance_id=offered_service.instance_id,
-                major_version=offered_service.major_version,
-                eventgroup=requested_subscription.eventgroup,
-                ttl_seconds=requested_subscription.ttl_seconds,
-                client_endpoint=client_endpoint,
-                server_endpoint=server_endpoint,
-                protocols=frozenset(requested_protocols),
-                timestamp_last_update=time.time(),
-            )
-            self._pending_subscriptions.add(pending_subscription)
+        # Build subscribe message
+        sd_message = SdMessage()
+        sd_message.session_id = session_id
+        sd_message.reboot_flag = reboot_flag
 
-            if self._ucast_transport:
-                self._ucast_transport.sendto(
-                    serialize_sd_message(sd_message),
-                    (str(offered_service.endpoint.ip), self.sd_port),
+        options = []
+        for protocol in requested_protocols:
+            options.append(
+                IpV4EndpointOption(
+                    address=requested_subscription.client_endpoint.ip,
+                    protocol=protocol,
+                    port=requested_subscription.client_endpoint.port,
                 )
+            )
+
+        entry = SubscribeEventGroupEntry(
+            service_id=offered_service.service_id,
+            instance_id=offered_service.instance_id,
+            major_version=offered_service.major_version,
+            ttl=requested_subscription.ttl_seconds,
+            eventgroup_id=requested_subscription.eventgroup.id,
+            counter=0,
+            ip_v4_endpoints=options,
+            ip_v6_endpoints=[],
+        )
+        sd_message.entries.append(entry)
+
+        pending_subscription = Subscription(
+            service_id=offered_service.service_id,
+            instance_id=offered_service.instance_id,
+            major_version=offered_service.major_version,
+            eventgroup=requested_subscription.eventgroup,
+            ttl_seconds=requested_subscription.ttl_seconds,
+            client_endpoint=requested_subscription.client_endpoint,
+            server_endpoint=offered_service.endpoint,
+            protocols=frozenset(requested_protocols),
+            timestamp_last_update=time.time(),
+        )
+        self._pending_subscriptions.add(pending_subscription)
+
+        if self._ucast_transport:
+            self._ucast_transport.sendto(
+                serialize_sd_message(sd_message),
+                (str(offered_service.endpoint.ip), self.sd_port),
+            )
 
     def _handle_subscription(
         self,

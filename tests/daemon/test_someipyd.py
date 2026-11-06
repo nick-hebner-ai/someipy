@@ -265,6 +265,7 @@ async def test_handle_offered_service_opens_tcp_client_endpoint(
         service_instance.endpoint,
         daemon._someip_message_callback,
         daemon.logger,
+        sock=None,
     )
 
     assert len(daemon._pending_subscriptions) == 1
@@ -1418,3 +1419,265 @@ async def test_method_call_from_an_offered_port_shares_its_socket(
     assert len(bound) == 1
     bound[0].sendto.assert_called_once()
     assert bound[0].sendto.call_args.args[1] == ("192.168.1.20", 30501)
+
+
+def _tcp_subscribe_request(ip: str, port: int, eventgroup_id: int = 1):
+    eventgroup = EventGroup(
+        id=eventgroup_id, events=[Event(id=1, protocol=TransportLayerProtocol.TCP)]
+    )
+    return SubscribeEventGroupRequest(
+        service_id=1,
+        instance_id=2,
+        major_version=3,
+        ttl_subscription=10,
+        eventgroup=eventgroup.to_json(),
+        client_endpoint_ip=ip,
+        client_endpoint_port=port,
+        udp=False,
+        tcp=True,
+    )
+
+
+def _tcp_offer(ip: str = "192.168.1.20", port: int = 50009) -> ServiceInstance:
+    return ServiceInstance(
+        service_id=1,
+        instance_id=2,
+        major_version=3,
+        minor_version=0,
+        ttl=3,
+        endpoint=Endpoint(ipaddress.IPv4Address(ip), port),
+        protocols=frozenset([TransportLayerProtocol.TCP]),
+        timestamp=1000,
+    )
+
+
+def _fake_tcp_client_endpoint(src_ip: str, src_port: int, dst: Endpoint):
+    connected = asyncio.Event()
+    endpoint = Mock()
+    endpoint.protocol = Mock(return_value=TransportLayerProtocol.TCP)
+    endpoint.src_ip = Mock(return_value=src_ip)
+    endpoint.src_port = Mock(return_value=src_port)
+    endpoint.dst_ip = Mock(return_value=str(dst.ip))
+    endpoint.dst_port = Mock(return_value=dst.port)
+    endpoint.is_connected = Mock(side_effect=connected.is_set)
+    endpoint.wait_connected = connected.wait
+    endpoint.connect = connected.set
+    return endpoint
+
+
+@pytest.fixture
+def sent_sd_messages():
+    sent = []
+
+    def capture(message):
+        sent.append(message)
+        return b""
+
+    with patch("someipy.someipyd.serialize_sd_message", side_effect=capture):
+        yield sent
+
+
+def _endpoint_options(sd_messages: list) -> list:
+    return [
+        option
+        for message in sd_messages
+        for entry in message.entries
+        for option in entry.ip_v4_endpoints
+    ]
+
+
+def _tcp_client_endpoint_factory(mock_endpoint_factory: Mock) -> list:
+    created = []
+
+    def create(dst, src, callback, logger, sock=None):
+        port = sock.getsockname()[1] if sock is not None else src.port
+        endpoint = _fake_tcp_client_endpoint(str(src.ip), port, dst)
+        endpoint.sock = sock
+        created.append(endpoint)
+        return endpoint
+
+    mock_endpoint_factory.create_tcp_client_endpoint = Mock(side_effect=create)
+    return created
+
+
+@pytest.mark.asyncio
+async def test_tcp_subscribe_is_sent_once_the_connection_is_up(
+    daemon: SomeipDaemon, mock_endpoint_factory, sent_sd_messages
+):
+    created = _tcp_client_endpoint_factory(mock_endpoint_factory)
+    await daemon._handle_subscribe_eventgroup_request(
+        _tcp_subscribe_request("192.168.1.10", 50009), 1
+    )
+
+    daemon._handle_offered_service(_tcp_offer())
+    daemon._handle_offered_service(_tcp_offer())
+    await asyncio.sleep(0)
+    daemon._ucast_transport.sendto.assert_not_called()
+
+    created[0].connect()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert len(created) == 1
+    daemon._ucast_transport.sendto.assert_called_once()
+    (option,) = _endpoint_options(sent_sd_messages)
+    assert option.protocol == TransportLayerProtocol.TCP
+    assert option.port == 50009
+
+
+@pytest.mark.asyncio
+async def test_tcp_subscribe_on_a_connected_endpoint_is_sent_at_once(
+    daemon: SomeipDaemon, mock_endpoint_factory
+):
+    created = _tcp_client_endpoint_factory(mock_endpoint_factory)
+    await daemon._handle_subscribe_eventgroup_request(
+        _tcp_subscribe_request("192.168.1.10", 50009), 1
+    )
+    daemon._handle_offered_service(_tcp_offer())
+    created[0].connect()
+    await asyncio.sleep(0)
+    daemon._ucast_transport.sendto.reset_mock()
+
+    daemon._handle_offered_service(_tcp_offer())
+
+    daemon._ucast_transport.sendto.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_tcp_subscribe_is_dropped_if_unsubscribed_while_connecting(
+    daemon: SomeipDaemon, mock_endpoint_factory
+):
+    created = _tcp_client_endpoint_factory(mock_endpoint_factory)
+    request = _tcp_subscribe_request("192.168.1.10", 50009)
+    await daemon._handle_subscribe_eventgroup_request(request, 1)
+    daemon._handle_offered_service(_tcp_offer())
+
+    daemon._handle_stop_subscribe_eventgroup_request(
+        create_uds_message(StopSubscribeEventGroupRequest, **{
+            k: request[k] for k in (
+                "service_id", "instance_id", "major_version", "eventgroup",
+                "client_endpoint_ip", "client_endpoint_port", "udp", "tcp",
+            )
+        }),
+        1,
+    )
+    created[0].connect()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    daemon._ucast_transport.sendto.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_port_zero_tcp_subscription_advertises_a_bound_port(
+    daemon: SomeipDaemon, mock_endpoint_factory, sent_sd_messages
+):
+    created = _tcp_client_endpoint_factory(mock_endpoint_factory)
+    await daemon._handle_subscribe_eventgroup_request(
+        _tcp_subscribe_request("127.0.0.1", 0), 1
+    )
+    (subscription,) = daemon._requested_subscriptions.subscriptions
+    port = subscription.client_endpoint.port
+    assert port != 0
+
+    daemon._handle_offered_service(_tcp_offer())
+    created[0].connect()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert created[0].sock.getsockname() == ("127.0.0.1", port)
+    (option,) = _endpoint_options(sent_sd_messages)
+    assert option.port == port
+    created[0].sock.close()
+
+
+@pytest.mark.asyncio
+async def test_port_zero_tcp_subscriptions_of_one_client_share_a_port(
+    daemon: SomeipDaemon,
+):
+    await daemon._handle_subscribe_eventgroup_request(
+        _tcp_subscribe_request("127.0.0.1", 0, eventgroup_id=1), 1
+    )
+    await daemon._handle_subscribe_eventgroup_request(
+        _tcp_subscribe_request("127.0.0.1", 0, eventgroup_id=2), 1
+    )
+
+    ports = {s.client_endpoint.port for s in daemon._requested_subscriptions.subscriptions}
+    assert len(ports) == 1
+    assert len(daemon._tcp_port_reservations) == 1
+    daemon._release_tcp_port_reservations(1)
+
+
+@pytest.mark.asyncio
+async def test_port_zero_tcp_unsubscribe_matches_the_subscription(
+    daemon: SomeipDaemon,
+):
+    request = _tcp_subscribe_request("127.0.0.1", 0)
+    await daemon._handle_subscribe_eventgroup_request(request, 1)
+
+    daemon._handle_stop_subscribe_eventgroup_request(
+        create_uds_message(StopSubscribeEventGroupRequest, **{
+            k: request[k] for k in (
+                "service_id", "instance_id", "major_version", "eventgroup",
+                "client_endpoint_ip", "client_endpoint_port", "udp", "tcp",
+            )
+        }),
+        1,
+    )
+
+    assert len(daemon._requested_subscriptions.subscriptions) == 0
+    daemon._release_tcp_port_reservations(1)
+
+
+@pytest.mark.asyncio
+async def test_disconnecting_client_releases_its_tcp_port_reservation(
+    daemon: SomeipDaemon,
+):
+    await daemon._handle_subscribe_eventgroup_request(
+        _tcp_subscribe_request("127.0.0.1", 0), 1
+    )
+    ((_, sock),) = daemon._tcp_port_reservations.values()
+
+    client = Mock(spec=DaemonServerClient)
+    client.id = 1
+    client.message_received = someipy._internal._common.event.Event()
+    await daemon.client_disconnected(daemon, ClientConnectedEventArgs(client))
+
+    assert daemon._tcp_port_reservations == {}
+    assert sock.fileno() == -1
+
+
+@pytest.mark.asyncio
+async def test_port_zero_tcp_method_calls_reuse_one_connection(
+    daemon: SomeipDaemon, mock_endpoint_factory
+):
+    created = _tcp_client_endpoint_factory(mock_endpoint_factory)
+
+    def call():
+        return create_uds_message(
+            OutboundCallMethodRequest,
+            service_id=7,
+            instance_id=1,
+            method_id=1,
+            client_id=1,
+            session_id=1,
+            protocol_version=0x01,
+            major_version=1,
+            minor_version=0,
+            dst_endpoint_ip="192.168.1.20",
+            dst_endpoint_port=50009,
+            src_endpoint_ip="192.168.1.10",
+            src_endpoint_port=0,
+            protocol=TransportLayerProtocol.TCP.value,
+            payload=base64.b64encode(b"\x01").decode(),
+        )
+
+    first = asyncio.create_task(daemon._handle_outbound_call_method_request(call(), 1))
+    await asyncio.sleep(0)
+    created[0].src_port.return_value = 41000
+    created[0].connect()
+    await first
+    await daemon._handle_outbound_call_method_request(call(), 1)
+
+    assert len(created) == 1
+    assert created[0].sendto.call_count == 2

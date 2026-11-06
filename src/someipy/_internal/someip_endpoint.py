@@ -14,9 +14,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio
+import socket
 from abc import ABC, abstractmethod, abstractproperty
 from logging import Logger
-from typing import Callable, Tuple, Any, Union
+from typing import Callable, Optional, Tuple, Any, Union
 from someipy._internal.logging import get_logger
 from someipy._internal.someip_message import SomeIpMessage
 from someipy._internal.tcp_client_manager import (
@@ -25,7 +26,7 @@ from someipy._internal.tcp_client_manager import (
 )
 from someipy._internal.tcp_connection import TcpConnection
 from someipy._internal.transport_layer_protocol import TransportLayerProtocol
-from someipy._internal.utils import EndpointType
+from someipy._internal.utils import EndpointType, create_tcp_client_socket
 from someipy._internal.someip_data_processor import SomeipDataProcessor
 
 
@@ -204,7 +205,10 @@ class TCPClientSomeipEndpoint(SomeipEndpoint):
         src_ip: str,
         src_port: str,
         logger: Logger = None,
+        sock: Optional[socket.socket] = None,
     ):
+        """sock, if given, is a socket already bound to src_ip:src_port, used
+        for the first connection attempt."""
         self._tcp_connection: TcpConnection = None
         self._protocol: TransportLayerProtocol = TransportLayerProtocol.TCP
         self._dst_ip = dst_ip
@@ -212,6 +216,8 @@ class TCPClientSomeipEndpoint(SomeipEndpoint):
         self._src_ip = src_ip
         self._src_port = src_port
         self._logger = logger
+        self._bound_socket = sock
+        self._connected = asyncio.Event()
 
         self._callback: Callable[
             [SomeIpMessage, Tuple[str, int], Tuple[str, int], TransportLayerProtocol],
@@ -229,24 +235,47 @@ class TCPClientSomeipEndpoint(SomeipEndpoint):
     def is_connected(self) -> bool:
         return self._tcp_connection is not None and self._tcp_connection.is_open()
 
+    async def wait_connected(self) -> None:
+        await self._connected.wait()
+
+    def _bind(self) -> socket.socket:
+        sock, self._bound_socket = self._bound_socket, None
+        if sock is None:
+            sock = create_tcp_client_socket(self._src_ip, self._src_port)
+        # Keeps the port a bind to port 0 resolved, so reconnects reuse the
+        # port that SubscribeEventgroup endpoint options advertise.
+        self._src_port = sock.getsockname()[1]
+        return sock
+
     async def _connect_and_receive(self) -> None:
         try:
             while True:
-                self._log(f"Trying to connect to ({self._dst_ip}, {self._dst_port})")
+                self._log(
+                    f"Trying to connect from ({self._src_ip}, {self._src_port}) "
+                    f"to ({self._dst_ip}, {self._dst_port})"
+                )
 
                 self._tcp_connection = TcpConnection(self._dst_ip, self._dst_port)
 
+                sock = None
                 try:
-                    await self._tcp_connection.connect(self._src_ip, self._src_port)
-                except OSError:
+                    sock = self._bind()
+                    await self._tcp_connection.connect(sock)
+                except OSError as e:
+                    if sock is not None:
+                        sock.close()
                     self._log(
-                        f"Connection refused while connecting to ({self._dst_ip}, {self._dst_port}). Try to reconnect in 1 second"
+                        f"Could not connect to ({self._dst_ip}, {self._dst_port}): {e}. "
+                        "Try to reconnect in 1 second"
                     )
-                    # Wait a second before trying to connect again
                     await asyncio.sleep(1.0)
                     continue
 
-                self._log(f"Start reading on port {self._src_port}")
+                self._log(
+                    f"Connected from ({self._src_ip}, {self._src_port}) "
+                    f"to ({self._dst_ip}, {self._dst_port})"
+                )
+                self._connected.set()
 
                 someip_processor = SomeipDataProcessor()
 
@@ -276,10 +305,12 @@ class TCPClientSomeipEndpoint(SomeipEndpoint):
                             f"Error while reading from TCP connection ({self._src_ip}, {self._src_port}): {e}"
                         )
 
+                self._connected.clear()
                 await self._tcp_connection.close()
 
         except asyncio.CancelledError:
-            if self._tcp_connection.is_open():
+            self._connected.clear()
+            if self._tcp_connection is not None and self._tcp_connection.is_open():
                 await self._tcp_connection.close()
             self._log("TCP task is cancelled. Raise again.")
             raise
@@ -301,6 +332,9 @@ class TCPClientSomeipEndpoint(SomeipEndpoint):
         raise NotImplementedError("No implementation for TCP client endpoint.")
 
     def shutdown(self) -> None:
+        if self._bound_socket is not None:
+            self._bound_socket.close()
+            self._bound_socket = None
         try:
             if self._connect_and_receive_task:
                 self._connect_and_receive_task.cancel()
