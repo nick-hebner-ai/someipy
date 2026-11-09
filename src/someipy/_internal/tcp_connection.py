@@ -14,6 +14,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio
+import socket
 from someipy._internal.logging import get_logger
 
 _logger_name = "tcp_connection"
@@ -26,11 +27,12 @@ class TcpConnection:
         self.reader = None
         self.writer = None
 
-    async def connect(self, src_ip: str, src_port: int):
-        local_addr = (src_ip, src_port)
-        self.reader, self.writer = await asyncio.open_connection(
-            self.remote_ip, self.remote_port, local_addr=local_addr
+    async def connect(self, sock: socket.socket):
+        """Connect an already bound, non-blocking socket to the remote endpoint."""
+        await asyncio.get_running_loop().sock_connect(
+            sock, (self.remote_ip, self.remote_port)
         )
+        self.reader, self.writer = await asyncio.open_connection(sock=sock)
         get_logger(_logger_name).debug(
             f"Connected to {self.remote_ip}:{self.remote_port}"
         )

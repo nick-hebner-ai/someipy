@@ -49,6 +49,25 @@ def create_udp_socket(ip_address: str, port: int) -> socket.socket:
     return sock
 
 
+def create_tcp_client_socket(ip_address: str, port: int) -> socket.socket:
+    """Create a non-blocking TCP socket bound to ip_address:port, ready to connect.
+
+    SO_REUSEADDR lets a reconnect bind the same port while the previous
+    connection is still in TIME_WAIT, and lets connections to different peers
+    share one source port.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if platform.system() == "Linux":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setblocking(False)
+        sock.bind((ip_address, port))
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
 def create_rcv_multicast_socket(
     ip_address: str, port: int, interface_address
 ) -> socket.socket:

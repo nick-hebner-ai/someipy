@@ -16,7 +16,8 @@
 import asyncio
 from collections.abc import Callable
 import logging
-from typing import Tuple
+import socket
+from typing import Optional, Tuple
 from someipy._internal._common.endpoint import Endpoint
 from someipy._internal.someip_endpoint import (
     SomeipEndpoint,
@@ -96,6 +97,7 @@ class SomeipEndpointFactory:
         src_endpoint: Endpoint,
         someip_message_callback: Callable[[SomeIpMessage], None],
         logger: logging.Logger = None,
+        sock: Optional[socket.socket] = None,
     ) -> TCPClientSomeipEndpoint:
         tcp_endpoint = TCPClientSomeipEndpoint(
             str(dst_endpoint.ip),
@@ -103,6 +105,7 @@ class SomeipEndpointFactory:
             str(src_endpoint.ip),
             src_endpoint.port,
             logger,
+            sock,
         )
         tcp_endpoint.set_someip_callback(someip_message_callback)
         return tcp_endpoint
