@@ -139,6 +139,19 @@ class SendEventRequest(BaseMessage):
     payload: str
 
 
+class SendRawRequest(BaseMessage):
+    """Ask the daemon to send ``payload`` as one UDP datagram, without a SOME/IP
+    header, from an offered instance's endpoint."""
+
+    service_id: int
+    instance_id: int
+    major_version: int
+    eventgroup_id: int
+    src_endpoint_ip: str
+    src_endpoint_port: int
+    payload: str  # Base64
+
+
 class SubscribeEventGroupRequest(BaseMessage):
     service_id: int
     instance_id: int

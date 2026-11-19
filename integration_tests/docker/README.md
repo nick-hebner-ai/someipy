@@ -39,6 +39,18 @@ Requires Docker and permission to create a bridge network (no root needed inside
 the tests; the vsomeip container is granted `NET_ADMIN` only to add its SD
 route).
 
+## Raw datagram cases
+
+`send_raw_udp` offers a service with `example_apps/send_raw_udp.py`, which sends
+complete SOME/IP notification datagrams with `ServerServiceInstance.send_raw`
+while the service is offered, withdrawn and offered again. The vsomeip
+`send_events` peer must receive the datagrams byte for byte while offered and
+none while withdrawn (checked on the peer and in the daemon log).
+`send_raw_udp_remote_app` runs the same app in a third container that reaches
+the daemon over its TCP control link and offers the daemon container's address,
+which is not local to the app. `send_events_udp` is a control for plain event
+delivery.
+
 ## Adding a test
 
 Register a `Case` in `run.py` with the someipy example app, the vsomeip peer app

@@ -20,8 +20,10 @@ into the daemon container, so whatever revision is checked out is what is tested
 """
 
 import argparse
+import errno
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,7 @@ NETWORK = "someipy-itest-net"
 SUBNET = "172.28.0.0/16"
 IP_SOMEIPY = "172.28.0.2"  # someipy daemon + app
 IP_VSOMEIP = "172.28.0.3"  # vsomeip peer
+IP_APP = "172.28.0.4"  # someipy app in its own container (remote-app cases)
 SD_MULTICAST = "224.224.224.245"
 SD_PORT = 30490
 
@@ -70,15 +73,15 @@ def _disable_bridge_multicast_snooping():
     )
 
 
-def someipyd_config(sd_address=SD_MULTICAST) -> str:
+def someipyd_config(sd_address=SD_MULTICAST, use_tcp=False, tcp_host=IP_SOMEIPY) -> str:
     return (
         '{\n'
         f'    "sd_address": "{sd_address}",\n'
         f'    "sd_port": {SD_PORT},\n'
         '    "log_level": "DEBUG",\n'
         f'    "interface": "{IP_SOMEIPY}",\n'
-        '    "use_tcp": false,\n'
-        f'    "tcp_host": "{IP_SOMEIPY}",\n'
+        f'    "use_tcp": {str(use_tcp).lower()},\n'
+        f'    "tcp_host": "{tcp_host}",\n'
         '    "tcp_port": 30500\n'
         '}\n'
     )
@@ -127,12 +130,19 @@ class Case:
     """A test case: a someipy example app paired with a vsomeip peer app.
 
     evaluate(someipy_lines, vsomeip_lines) -> bool decides pass/fail from the
-    captured stdout of each side.
+    captured stdout of each side. The optional evaluate_daemon(daemon_lines) ->
+    bool adds a check on the daemon log.
+
+    With app_container=True the someipy app runs in its own container and
+    reaches the daemon over its TCP control link, so the address the app
+    offers is not local to it. app_args are extra command-line arguments for
+    the example app.
     """
 
     def __init__(self, name, someipy_app, vsomeip_app, evaluate,
                  vsomeip_offers=None, sd_address=SD_MULTICAST,
-                 vsomeip_sd_overrides=None, duration=16):
+                 vsomeip_sd_overrides=None, duration=16,
+                 evaluate_daemon=None, app_container=False, app_args=""):
         self.name = name
         self.someipy_app = someipy_app  # file under example_apps/
         self.vsomeip_app = vsomeip_app  # installed dir/binary name
@@ -143,13 +153,17 @@ class Case:
         self.sd_address = sd_address  # SD multicast group for this case
         self.vsomeip_sd_overrides = vsomeip_sd_overrides  # merge into SD config
         self.duration = duration  # per-case default run duration (seconds)
+        self.evaluate_daemon = evaluate_daemon
+        self.app_container = app_container
+        self.app_args = app_args
 
 
 def run_case(case: "Case", duration: int, keep: bool) -> bool:
     ensure_network()
     name_a = f"someipy-itest-{case.name}-a"
     name_b = f"someipy-itest-{case.name}-b"
-    _run(["docker", "rm", "-f", name_a, name_b])
+    name_c = f"someipy-itest-{case.name}-c"
+    _run(["docker", "rm", "-f", name_a, name_b, name_c])
 
     with tempfile.TemporaryDirectory() as workdir:
         cfg_dir = os.path.join(workdir, "cfg")
@@ -157,18 +171,33 @@ def run_case(case: "Case", duration: int, keep: bool) -> bool:
         os.makedirs(cfg_dir)
         os.makedirs(logs_dir)
         with open(os.path.join(cfg_dir, "someipyd.json"), "w") as f:
-            f.write(someipyd_config(case.sd_address))
+            f.write(someipyd_config(case.sd_address, use_tcp=case.app_container))
         with open(os.path.join(cfg_dir, "vsomeip-client.json"), "w") as f:
             f.write(vsomeip_config(case.vsomeip_offers, case.sd_address,
                                    case.vsomeip_sd_overrides))
 
-        someipy_cmd = (
+        daemon_cmd = (
             "PYTHONPATH=/work/src python3 /work/src/someipy/someipyd.py "
-            "--config /cfg/someipyd.json >/logs/daemon.log 2>&1 & "
-            "sleep 2; "
-            f"PYTHONPATH=/work/src python3 /work/example_apps/{case.someipy_app} "
-            f"--interface_ip {IP_SOMEIPY} >/logs/app.log 2>&1"
+            "--config /cfg/someipyd.json >/logs/daemon.log 2>&1"
         )
+        app_cmd = (
+            f"PYTHONPATH=/work/src python3 /work/example_apps/{case.someipy_app} "
+        )
+        if case.app_container:
+            someipy_cmd = daemon_cmd
+            app_cmd = (
+                "sleep 4; "
+                + app_cmd
+                + f"--interface_ip {IP_APP} --offer_ip {IP_SOMEIPY} "
+                + f"--daemon_tcp_host {IP_SOMEIPY} {case.app_args} >/logs/app.log 2>&1"
+            )
+        else:
+            someipy_cmd = (
+                daemon_cmd
+                + " & sleep 2; "
+                + app_cmd
+                + f"--interface_ip {IP_SOMEIPY} {case.app_args} >/logs/app.log 2>&1"
+            )
         # vsomeip needs a route covering the SD multicast group before its
         # Service Discovery will start (sd_wait_route).
         vsomeip_cmd = (
@@ -186,6 +215,9 @@ def run_case(case: "Case", duration: int, keep: bool) -> bool:
         ]
         _run(common + ["--name", name_a, "--ip", IP_SOMEIPY,
                        "-v", f"{REPO_ROOT}:/work:ro", IMAGE, "-c", someipy_cmd])
+        if case.app_container:
+            _run(common + ["--name", name_c, "--ip", IP_APP,
+                           "-v", f"{REPO_ROOT}:/work:ro", IMAGE, "-c", app_cmd])
         _run(common + ["--name", name_b, "--ip", IP_VSOMEIP,
                        "--cap-add", "NET_ADMIN", "--user", "root", IMAGE, "-c", vsomeip_cmd])
 
@@ -203,9 +235,11 @@ def run_case(case: "Case", duration: int, keep: bool) -> bool:
         vsomeip_lines = read("vsomeip.log")
 
         if not keep:
-            _run(["docker", "rm", "-f", name_a, name_b])
+            _run(["docker", "rm", "-f", name_a, name_b, name_c])
 
         ok = case.evaluate(someipy_lines, vsomeip_lines)
+        if case.evaluate_daemon is not None:
+            ok = case.evaluate_daemon(daemon_lines) and ok
         if not ok:
             print(f"--- [{case.name}] someipy app ---")
             print("\n".join(someipy_lines[-40:]))
@@ -260,6 +294,75 @@ def _eval_rediscovery(someipy_lines, vsomeip_lines):
     return initial and rediscovered
 
 
+def _raw_phase_counts(someipy_lines, vsomeip_lines):
+    # Payloads the app reports sending per phase, and the notifications the peer
+    # received per phase marker (RAWA/RAWB/RAWC, hex "52 41 57 41" ...).
+    markers = {"A": "52 41 57 41", "B": "52 41 57 42", "C": "52 41 57 43"}
+    sent = {phase: set() for phase in markers}
+    for line in someipy_lines:
+        m = re.search(r"raw sent phase=([ABC]) n=\d+ payload=(.+)$", line)
+        if m:
+            sent[m.group(1)].add(m.group(2).strip())
+    received = {phase: [] for phase in markers}
+    for line in vsomeip_lines:
+        m = re.search(r"received a notification .*= \(\d+\) (.+)$", line)
+        if not m:
+            continue
+        payload = m.group(1).strip()
+        for phase, marker in markers.items():
+            if payload.startswith(marker):
+                received[phase].append(payload)
+    return sent, received
+
+
+def _eval_send_raw(someipy_lines, vsomeip_lines):
+    # The app builds complete SOME/IP notification datagrams itself and sends
+    # them with send_raw. The peer must receive them byte for byte while the
+    # service is offered, none while it is withdrawn, and again after it is
+    # offered again.
+    got_available = any("is available" in l for l in vsomeip_lines)
+    sent, received = _raw_phase_counts(someipy_lines, vsomeip_lines)
+    verbatim = all(p in sent["A"] for p in received["A"])
+    print(f"  service available={got_available} "
+          f"A={len(received['A'])} B={len(received['B'])} C={len(received['C'])} "
+          f"verbatim={verbatim}")
+    return (got_available and len(received["A"]) > 0 and verbatim
+            and len(received["B"]) == 0 and len(received["C"]) > 0)
+
+
+def _eval_send_raw_remote_app(someipy_lines, vsomeip_lines):
+    # Same as _eval_send_raw, with the app in another container: the offered
+    # address does not exist there, so binding it locally must fail.
+    failed = [l for l in someipy_lines
+              if "local bind of offer address failed: errno=" in l]
+    bind_failed = bool(failed) and failed[0].endswith(f"errno={errno.EADDRNOTAVAIL}")
+    print(f"  local bind of offer address failed with EADDRNOTAVAIL={bind_failed}")
+    return bind_failed and _eval_send_raw(someipy_lines, vsomeip_lines)
+
+
+def _eval_send_raw_daemon(daemon_lines):
+    # Between the stop-offer and the next offer, the daemon must receive raw
+    # send requests (positive control) and send none of them to a subscriber.
+    sent_re = re.compile(r"Sent raw payload \(\d+ bytes\) .* to (\d+) subscriber")
+    withdrawn = False
+    dropped = 0
+    sent_while_withdrawn = 0
+    for line in daemon_lines:
+        if "Send stop offer message for service 0x1234" in line:
+            withdrawn = True
+        elif "Starting new offer timer" in line:
+            withdrawn = False
+        elif withdrawn and "not offered" in line and "raw payload" in line:
+            dropped += 1
+        elif withdrawn:
+            m = sent_re.search(line)
+            if m and int(m.group(1)) > 0:
+                sent_while_withdrawn += 1
+    print(f"  daemon: dropped_while_withdrawn={dropped} "
+          f"sent_while_withdrawn={sent_while_withdrawn}")
+    return dropped > 0 and sent_while_withdrawn == 0
+
+
 TESTS = [
     Case("offer_method_udp", "offer_method_udp.py", "offer_method_udp", _eval_offer_method),
     Case("fire_and_forget_udp", "offer_method_udp.py", "fire_and_forget_udp", _eval_fire_and_forget),
@@ -287,6 +390,22 @@ TESTS = [
          # answered after vsomeip's request_response_delay). 26s races the
          # teardown against the answer; 34s leaves comfortable margin.
          duration=34),
+    # The application builds whole SOME/IP datagrams itself and sends them with
+    # send_raw from the offered endpoint: delivered verbatim while offered,
+    # not while withdrawn, and again after re-offer.
+    Case("send_raw_udp", "send_raw_udp.py", "send_events", _eval_send_raw,
+         evaluate_daemon=_eval_send_raw_daemon, duration=24),
+    # Same, with the application in a separate container that reaches the
+    # daemon over TCP and offers the daemon container's address, which is not
+    # local to the application.
+    Case("send_raw_udp_remote_app", "send_raw_udp.py", "send_events",
+         _eval_send_raw_remote_app, evaluate_daemon=_eval_send_raw_daemon,
+         duration=26, app_container=True, app_args="--probe_local_bind"),
+    # Control: the event subscription path the raw cases build on.
+    Case("send_events_udp", "send_events_udp.py", "send_events",
+         lambda someipy_lines, vsomeip_lines: any(
+             "received a notification" in l for l in vsomeip_lines),
+         duration=16),
 ]
 
 

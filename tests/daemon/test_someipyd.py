@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import someipy
 from someipy._internal._common.endpoint import Endpoint
 from someipy._internal._daemon.daemon_server import ClientConnectedEventArgs
+from someipy._internal._daemon.daemon_server_client import ClientMessageEventArgs
 from someipy._internal._daemon.daemon_server_client import DaemonServerClient
 from someipy._internal._daemon.subscription import Subscription
 from someipy._internal._daemon.uds_messages import (
@@ -20,6 +21,7 @@ from someipy._internal._daemon.uds_messages import (
     InboundCallMethodResponse,
     OfferServiceRequest,
     SendEventRequest,
+    SendRawRequest,
     StopOfferServiceRequest,
     StopSubscribeEventGroupRequest,
     SubscribeEventGroupRequest,
@@ -815,6 +817,313 @@ def test_send_event_does_not_log_error_when_endpoint_present(daemon):
         "server endpoint" in str(call.args[0])
         for call in daemon.logger.error.call_args_list
     )
+
+
+def _offered_service_with_subscribers(daemon, subscribers_by_eventgroup):
+    """Offer service 0x1234/0x5678 with eventgroups 3 and 4 and subscribe each
+    (eventgroup id, endpoint) pair given. Returns the service."""
+    eventgroups = [
+        EventGroup(
+            id=0x0003, events=[Event(id=0x0001, protocol=TransportLayerProtocol.UDP)]
+        ),
+        EventGroup(
+            id=0x0004, events=[Event(id=0x0002, protocol=TransportLayerProtocol.UDP)]
+        ),
+    ]
+    service = ServiceToOffer(
+        client_writer_id=1,
+        instance_id=0x5678,
+        service_id=0x1234,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.2"), 3000),
+        methods=[],
+        eventgroups=eventgroups,
+    )
+    daemon._services_to_offer.add_service(service)
+    subscribers = Subscribers()
+    for eventgroup_id, endpoint in subscribers_by_eventgroup:
+        subscribers.add_subscriber(
+            EventGroupSubscriber(
+                eventgroup_id=eventgroup_id, endpoint=endpoint, ttl=0xFFFFFF
+            )
+        )
+    daemon._service_subscribers[service] = subscribers
+    return service
+
+
+def _send_raw_message(payload=b"\x01\x02\x03", src=("127.0.0.2", 3000)):
+    return create_uds_message(
+        SendRawRequest,
+        service_id=0x1234,
+        instance_id=0x5678,
+        major_version=1,
+        eventgroup_id=0x0003,
+        src_endpoint_ip=src[0],
+        src_endpoint_port=src[1],
+        payload=base64.b64encode(payload).decode("utf-8"),
+    )
+
+
+def test_send_raw_sends_payload_verbatim_from_offered_endpoint(daemon):
+    _offered_service_with_subscribers(daemon, [(0x0003, ("127.0.0.1", 40000))])
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+
+    daemon._handle_send_raw_request(_send_raw_message(b"\xde\xad\xbe\xef"), 1)
+
+    # No SOME/IP header: exactly the bytes the client gave.
+    endpoint.sendto.assert_called_once_with(b"\xde\xad\xbe\xef", ("127.0.0.1", 40000))
+
+
+def test_send_raw_is_dispatched_by_message_type(daemon):
+    _offered_service_with_subscribers(daemon, [(0x0003, ("127.0.0.1", 40000))])
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+    client = MagicMock()
+    client.id = 1
+
+    asyncio.run(
+        daemon.handle_client_message(
+            None, ClientMessageEventArgs(client, _send_raw_message(b"\x09"))
+        )
+    )
+
+    endpoint.sendto.assert_called_once_with(b"\x09", ("127.0.0.1", 40000))
+
+
+def test_send_raw_goes_only_to_subscribers_of_the_eventgroup(daemon):
+    _offered_service_with_subscribers(
+        daemon,
+        [
+            (0x0003, ("127.0.0.1", 40000)),
+            (0x0004, ("127.0.0.1", 40001)),
+            (0x0003, ("127.0.0.3", 40002)),
+        ],
+    )
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+
+    assert [c.args[1] for c in endpoint.sendto.call_args_list] == [
+        ("127.0.0.1", 40000),
+        ("127.0.0.3", 40002),
+    ]
+
+
+def test_send_raw_sends_once_per_subscriber_endpoint(daemon):
+    service = _offered_service_with_subscribers(
+        daemon, [(0x0003, ("127.0.0.1", 40000))]
+    )
+    # A second, equal-endpoint subscriber that the storage did not merge.
+    daemon._service_subscribers[service].subscribers.append(
+        EventGroupSubscriber(
+            eventgroup_id=0x0003, endpoint=("127.0.0.1", 40000), ttl=0xFFFFFF
+        )
+    )
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+
+    endpoint.sendto.assert_called_once()
+
+
+def test_send_raw_sends_nothing_after_stop_offer(daemon):
+    # Subscribers outlive the offer in the daemon's bookkeeping; a stopped
+    # instance must not keep sending to them.
+    service = _offered_service_with_subscribers(
+        daemon, [(0x0003, ("127.0.0.1", 40000))]
+    )
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+    stop_offer = create_uds_message(
+        StopOfferServiceRequest,
+        service_id=service.service_id,
+        instance_id=service.instance_id,
+        major_version=service.major_version,
+        minor_version=service.minor_version,
+        endpoint_ip="127.0.0.2",
+        endpoint_port=3000,
+        ttl=service.offer_ttl_seconds,
+        eventgroup_list=[eg.to_json() for eg in service.eventgroups],
+        method_list=[],
+        cyclic_offer_delay_ms=service.cyclic_offer_delay_ms,
+    )
+
+    daemon._handle_stop_offer_service_request(stop_offer, 1)
+    assert len(daemon._services_to_offer) == 0
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+
+    endpoint.sendto.assert_not_called()
+
+
+def test_send_raw_ignores_other_instances(daemon):
+    _offered_service_with_subscribers(daemon, [(0x0003, ("127.0.0.1", 40000))])
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+    message = _send_raw_message()
+    message["instance_id"] = 0x9999
+
+    daemon._handle_send_raw_request(message, 1)
+
+    endpoint.sendto.assert_not_called()
+
+
+def test_send_raw_logs_error_when_no_server_endpoint(daemon):
+    _offered_service_with_subscribers(daemon, [(0x0003, ("127.0.0.1", 40000))])
+
+    daemon._handle_send_raw_request(_send_raw_message(src=("127.0.0.9", 9999)), 1)
+
+    assert any(
+        "no UDP server endpoint" in str(call.args[0])
+        for call in daemon.logger.error.call_args_list
+    )
+
+
+def test_send_raw_ignores_expired_subscribers(daemon):
+    service = _offered_service_with_subscribers(
+        daemon, [(0x0003, ("127.0.0.1", 40000))]
+    )
+    expired = daemon._service_subscribers[service].subscribers[0]
+    expired.ttl = 1
+    expired.last_ts_ms -= 10_000
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+
+    endpoint.sendto.assert_not_called()
+
+
+def test_send_raw_ignores_other_major_version(daemon):
+    _offered_service_with_subscribers(daemon, [(0x0003, ("127.0.0.1", 40000))])
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+    message = _send_raw_message()
+    message["major_version"] = 2
+
+    daemon._handle_send_raw_request(message, 1)
+
+    endpoint.sendto.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_raw_resumes_after_reoffer(daemon):
+    service = _offered_service_with_subscribers(
+        daemon, [(0x0003, ("127.0.0.1", 40000))]
+    )
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+    offer = create_uds_message(
+        OfferServiceRequest,
+        service_id=service.service_id,
+        instance_id=service.instance_id,
+        major_version=service.major_version,
+        minor_version=service.minor_version,
+        endpoint_ip="127.0.0.2",
+        endpoint_port=3000,
+        ttl=service.offer_ttl_seconds,
+        eventgroup_list=[eg.to_json() for eg in service.eventgroups],
+        method_list=[],
+        cyclic_offer_delay_ms=service.cyclic_offer_delay_ms,
+    )
+    stop_offer = create_uds_message(
+        StopOfferServiceRequest,
+        service_id=service.service_id,
+        instance_id=service.instance_id,
+        major_version=service.major_version,
+        minor_version=service.minor_version,
+        endpoint_ip="127.0.0.2",
+        endpoint_port=3000,
+        ttl=service.offer_ttl_seconds,
+        eventgroup_list=[eg.to_json() for eg in service.eventgroups],
+        method_list=[],
+        cyclic_offer_delay_ms=service.cyclic_offer_delay_ms,
+    )
+    daemon._endpoint_factory.create_server_endpoint = AsyncMock(return_value=endpoint)
+
+    daemon._handle_stop_offer_service_request(stop_offer, 1)
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+    endpoint.sendto.assert_not_called()
+
+    await daemon._handle_offer_service_request(offer, 1)
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+
+    endpoint.sendto.assert_called_once_with(b"\x01\x02\x03", ("127.0.0.1", 40000))
+
+
+def test_send_raw_without_subscribers_sends_nothing(daemon):
+    _offered_service_with_subscribers(daemon, [])
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+
+    endpoint.sendto.assert_not_called()
+    daemon.logger.error.assert_not_called()
+
+
+def test_send_raw_without_subscriber_table_sends_nothing(daemon):
+    service = _offered_service_with_subscribers(daemon, [])
+    del daemon._service_subscribers[service]
+    endpoint = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    daemon._someip_server_endpoints.add_endpoint(1, endpoint)
+
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+
+    endpoint.sendto.assert_not_called()
+    daemon.logger.error.assert_not_called()
+
+
+def test_send_raw_uses_the_endpoint_of_the_matching_offer(daemon):
+    _offered_service_with_subscribers(daemon, [(0x0003, ("127.0.0.1", 40000))])
+    other = ServiceToOffer(
+        client_writer_id=1,
+        instance_id=0x9999,
+        service_id=0x1234,
+        major_version=1,
+        minor_version=0,
+        offer_ttl_seconds=5,
+        cyclic_offer_delay_ms=2000,
+        endpoint=Endpoint(ipaddress.IPv4Address("127.0.0.2"), 3001),
+        methods=[],
+        eventgroups=[
+            EventGroup(
+                id=0x0003,
+                events=[Event(id=0x0001, protocol=TransportLayerProtocol.UDP)],
+            )
+        ],
+    )
+    daemon._services_to_offer.add_service(other)
+    other_subscribers = Subscribers()
+    other_subscribers.add_subscriber(
+        EventGroupSubscriber(
+            eventgroup_id=0x0003, endpoint=("127.0.0.1", 40001), ttl=0xFFFFFF
+        )
+    )
+    daemon._service_subscribers[other] = other_subscribers
+    matching = _server_endpoint_mock("127.0.0.2", 3000, TransportLayerProtocol.UDP)
+    other_endpoint = _server_endpoint_mock(
+        "127.0.0.2", 3001, TransportLayerProtocol.UDP
+    )
+    daemon._someip_server_endpoints.add_endpoint(1, other_endpoint)
+    daemon._someip_server_endpoints.add_endpoint(1, matching)
+
+    daemon._handle_send_raw_request(_send_raw_message(), 1)
+
+    matching.sendto.assert_called_once_with(b"\x01\x02\x03", ("127.0.0.1", 40000))
+    other_endpoint.sendto.assert_not_called()
+
+    message = _send_raw_message(src=("127.0.0.2", 3001))
+    message["instance_id"] = 0x9999
+    daemon._handle_send_raw_request(message, 1)
+
+    other_endpoint.sendto.assert_called_once_with(b"\x01\x02\x03", ("127.0.0.1", 40001))
+    matching.sendto.assert_called_once()
 
 
 def _server_endpoint_mock(ip, port, protocol):

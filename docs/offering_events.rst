@@ -114,6 +114,23 @@ Now that the service is offered, clients can subscribe to the eventgroup with ID
 
 Typical sending strategies for SOME/IP events are **cyclic updates** or **update on change**. Update on change means that an event is sent whenever the contained value changes. In a cyclic update, the event would be sent even if the contained data has not changed since the last publish.
 
+Sending Pre-Built Datagrams
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If the application already holds a complete datagram, use ``send_raw`` instead of ``send_event``. The payload is not wrapped in a SOME/IP header:
+
+.. code-block:: python
+
+   service_instance_temperature.send_raw(SAMPLE_EVENTGROUP_ID, datagram)
+
+- The someipy daemon sends exactly these bytes as one UDP datagram, from the offered endpoint of the service instance, to every subscriber of the eventgroup.
+- Nothing is sent while the instance is not offered.
+- The call is fire-and-forget: it does not wait for the daemon and reports no delivery result.
+- Only eventgroups with a UDP event are supported. A ``ValueError`` is raised for an unknown eventgroup or one without a UDP event.
+- There is no segmentation: the caller is responsible for the payload size.
+- The application does not need to be able to bind the offered address, so it can run in a different network namespace or on a different host than the daemon.
+- A daemon that does not support ``send_raw`` logs the request as an unknown message type and ignores it.
+
 Step 6: Shutdown the Application
 ------------------------------------------------
 

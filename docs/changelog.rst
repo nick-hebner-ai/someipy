@@ -8,6 +8,8 @@ HEAD
 
 Code changes to ``master`` that are *not* in the latest release:
 
+- Add ``ServerServiceInstance.send_raw`` to send a datagram verbatim from an offered instance's endpoint.
+
 Release v2.1.2
 -----------------
 - Fix SO_REUSEADDR socket option on Windows
