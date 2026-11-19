@@ -17,7 +17,11 @@ import base64
 from typing import List
 from someipy._internal.daemon_client_abcs import ServerInstanceInterface
 from someipy._internal._daemon.someipy_daemon_client import SomeIpDaemonClient
-from someipy._internal._daemon.uds_messages import create_uds_message, SendEventRequest
+from someipy._internal._daemon.uds_messages import (
+    create_uds_message,
+    SendEventRequest,
+    SendRawRequest,
+)
 from someipy.service import EventGroup, Method, Service
 
 from someipy._internal.logging import get_logger
@@ -198,6 +202,58 @@ class ServerServiceInstance(ServerInstanceInterface):
             src_endpoint_ip=self._endpoint_ip,
             src_endpoint_port=self._endpoint_port,
             payload=base64_encoded_payload,
+        )
+
+        self._daemon.transmit_message_to_daemon(message)
+
+    def send_raw(self, eventgroup_id: int, payload: bytes):
+        """Send a pre-built datagram to the clients subscribed to an event group.
+
+        Unlike :meth:`send_event`, the payload is not wrapped in a SOME/IP
+        header: the daemon sends exactly these bytes as one UDP datagram, from
+        this instance's offered endpoint, to each subscriber of the event group.
+        Nothing is sent while the instance is not offered. The call does not
+        wait for the daemon and reports no delivery result. The caller is
+        responsible for the payload size; there is no segmentation.
+
+        Parameters
+        ----------
+        eventgroup_id : int
+            ID of the event group whose subscribers receive the payload.
+        payload : bytes
+            The complete UDP payload to transmit.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the event group ID is not found within the service or the event
+            group has no UDP event.
+
+        """
+        if not eventgroup_id in self._service.eventgroupids:
+            raise ValueError(
+                f"Event group ID {eventgroup_id} not found in service 0x{self._service.id:04X}"
+            )
+
+        if not self._service.eventgroups[eventgroup_id].has_udp:
+            raise ValueError(
+                f"Event group ID {eventgroup_id} has no UDP event in service "
+                f"0x{self._service.id:04X}: raw payloads are sent over UDP only"
+            )
+
+        message = create_uds_message(
+            SendRawRequest,
+            service_id=self._service.id,
+            instance_id=self._instance_id,
+            major_version=self._service.major_version,
+            eventgroup_id=eventgroup_id,
+            src_endpoint_ip=self._endpoint_ip,
+            src_endpoint_port=self._endpoint_port,
+            payload=base64.b64encode(payload).decode("utf-8"),
         )
 
         self._daemon.transmit_message_to_daemon(message)

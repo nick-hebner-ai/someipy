@@ -103,6 +103,7 @@ from someipy._internal._daemon.uds_messages import (
     OutboundCallMethodResponse,
     ReceivedEvent,
     SendEventRequest,
+    SendRawRequest,
     StopOfferServiceRequest,
     StopSubscribeEventGroupRequest,
     SubscribeEventGroupRequest,
@@ -566,6 +567,7 @@ class SomeipDaemon:
             FindServiceRequest.__name__: self._handle_find_service_request,
             OutboundCallMethodRequest.__name__: self._handle_outbound_call_method_request,
             SendEventRequest.__name__: self._handle_send_event_request,
+            SendRawRequest.__name__: self._handle_send_raw_request,
             SubscribeEventGroupRequest.__name__: self._handle_subscribe_eventgroup_request,
             StopSubscribeEventGroupRequest.__name__: self._handle_stop_subscribe_eventgroup_request,
         }
@@ -1404,6 +1406,80 @@ class SomeipDaemon:
 
         # All probe attempts exhausted -- the service could not be resolved.
         self._send_find_service_failure(writer_id, message)
+
+    def _handle_send_raw_request(self, message: SendRawRequest, writer_id: int):
+        """Send a verbatim UDP payload from an offered instance's endpoint.
+
+        The payload is not wrapped in a SOME/IP header, which lets a client send
+        a pre-built datagram, such as a message serialized elsewhere, from the
+        address and port subscribers expect. Nothing is sent unless the
+        instance is currently offered.
+        """
+        payload = base64.b64decode(message["payload"])
+
+        for offered_service in self._services_to_offer.get_all_services():
+            if not (
+                offered_service.service_id == message["service_id"]
+                and offered_service.instance_id == message["instance_id"]
+                and offered_service.major_version == message["major_version"]
+                and message["eventgroup_id"] in offered_service.eventgroup_ids
+            ):
+                continue
+
+            subscribers = self._service_subscribers.get(offered_service)
+            if subscribers is None:
+                return
+            subscribers.update()
+
+            endpoint = self._someip_server_endpoints.get_endpoint_by_ip_port(
+                message["src_endpoint_ip"],
+                message["src_endpoint_port"],
+                TransportLayerProtocol.UDP,
+            )
+            if endpoint is None:
+                self.logger.error(
+                    "Dropping raw payload for service 0x%04x: "
+                    "no UDP server endpoint for %s:%s. Known endpoints: %s",
+                    offered_service.service_id,
+                    message["src_endpoint_ip"],
+                    message["src_endpoint_port"],
+                    [
+                        (e.src_ip(), e.src_port())
+                        for e in self._someip_server_endpoints.get_all_endpoints()
+                    ],
+                )
+                return
+
+            destinations = []
+            for subscriber in subscribers.subscribers:
+                if (
+                    subscriber.eventgroup_id == message["eventgroup_id"]
+                    and subscriber.endpoint not in destinations
+                ):
+                    destinations.append(subscriber.endpoint)
+
+            for destination in destinations:
+                self.logger.debug(
+                    f"Sending raw payload to subscriber {destination[0]}:{destination[1]}"
+                )
+                endpoint.sendto(payload, destination)
+
+            self.logger.debug(
+                "Sent raw payload (%d bytes) for service 0x%04x instance 0x%04x "
+                "eventgroup 0x%04x to %d subscriber(s)",
+                len(payload),
+                offered_service.service_id,
+                offered_service.instance_id,
+                message["eventgroup_id"],
+                len(destinations),
+            )
+            return
+
+        self.logger.debug(
+            "Dropping raw payload for service 0x%04x instance 0x%04x: not offered",
+            message["service_id"],
+            message["instance_id"],
+        )
 
     def _handle_send_event_request(self, message: SendEventRequest, writer_id: int):
         for sub in self._service_subscribers.values():
